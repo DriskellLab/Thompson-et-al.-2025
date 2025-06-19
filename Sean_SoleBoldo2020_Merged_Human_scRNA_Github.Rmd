@@ -1,0 +1,510 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+# **0. Load Packages**
+### scRNA-seq Analysis Packages
+```{r, warning=FALSE, message=FALSE}
+library(hdf5r)#read in .h5 cell ranger files
+library(Seurat)#had to install.packages('spatstat') as a Seurat dependency
+library(ggplot2)#for DotPlot and DotPlot table extraction
+library(sctransform)
+library(reticulate)
+#reticulate::py_install(packages ='umap-learn')# to install conda/umap-learn
+#install "BiocManager" in R
+library(limma)#for FindMarkers() function; install using BiocManager
+library(RColorBrewer)
+set.seed(1234)
+library(dplyr)
+library(readr)
+#library(Signac)#had to install 'AnnotationFilter', 'Biostrings', 'Rsamtools', 'biovizBase', 'ggbio' as a Signac dependency using BiocManager;
+library(GenomeInfoDb)#install using BiocManager
+library(viridisLite)#install using BiocManager
+library(EnsDb.Mmusculus.v79)#load the mm10 genomic data; install using BiocManager
+library(BSgenome)#install using BiocManager
+library(BSgenome.Mmusculus.UCSC.mm10)#install using BiocManager
+library(SummarizedExperiment)#install using BiocManager
+library(multtest)#install using BiocManager
+#library(metap)#install using BiocManager
+library(stringr)
+library(stringi)
+library(future)
+library(tictoc)#useful to time long steps
+plan('multisession', workers = 12)#cores = 12
+options(future.globals.maxSize = 64000 * 1024^2)
+```
+
+# Citation for scRNA-seq datasets
+Solé-Boldo, L. et al. Single-cell transcriptomes of the human skin reveal age-related loss of fibroblast priming. Commun Biol 3, 1–12 (2020). DOI: 10.1038/s42003-020-0922-4
+
+# **1a. Load the scRNA-seq Data & Create the Initial Seurat Object**
+## Load the CellRanger output(s) & initialize the Seurat object
+I use the .h5 files, which contain the filtered_feature_bc_matrix folder's files in addition to the metadata singlecell.csv file. Allows for 2-lines of code per sample :)
+```{r, warning=FALSE, message=FALSE}
+#load CellRanger H5 file output (contains reads, barcodes, metadata)
+scRNA_path <- '~/Ryan/H5Files/Sole-Boldo/'#define the path to the .h5 files on the server
+scRNA_WT1.data <- Read10X_h5(filename = paste(scRNA_path, 'old1', '_filtered_feature_bc_matrix.h5', sep = ''))#read in the cell ranger hdf5 file
+scRNA_WT1 <- CreateSeuratObject(counts = scRNA_WT1.data, min.cells = 3, min.features = 200,
+                                project = '53yo_Human')#default min.cells and min.features
+
+scRNA_WT2.data <- Read10X_h5(filename = paste(scRNA_path, 'old2', '_filtered_feature_bc_matrix.h5', sep = ''))#read in the cell ranger hdf5 file
+scRNA_WT2 <- CreateSeuratObject(counts = scRNA_WT2.data, min.cells = 3, min.features = 200,
+                                project = '70yo_Human')#default min.cells and min.features
+
+scRNA_WT3.data <- Read10X_h5(filename = paste(scRNA_path, 'old3', '_filtered_feature_bc_matrix.h5', sep = ''))#read in the cell ranger hdf5 file
+scRNA_WT3 <- CreateSeuratObject(counts = scRNA_WT3.data, min.cells = 3, min.features = 200,
+                                project = '69yo_Human')#default min.cells and min.features
+
+scRNA_WT4.data <- Read10X_h5(filename = paste(scRNA_path, 'young1', '_filtered_feature_bc_matrix.h5', sep = ''))#read in the cell ranger hdf5 file
+scRNA_WT4 <- CreateSeuratObject(counts = scRNA_WT4.data, min.cells = 3, min.features = 200,
+                                project = '25yo_Human')#default min.cells and min.features
+
+scRNA_WT5.data <- Read10X_h5(filename = paste(scRNA_path, 'young2', '_filtered_feature_bc_matrix.h5', sep = ''))#read in the cell ranger hdf5 file
+scRNA_WT5 <- CreateSeuratObject(counts = scRNA_WT5.data, min.cells = 3, min.features = 200,
+                                project = '27yo_Human')#default min.cells and min.features
+
+#view initial Seurat scRNA objects
+scRNA_WT1
+scRNA_WT2
+scRNA_WT3
+scRNA_WT4
+scRNA_WT5
+```
+## Merge & QC Check
+```{r, warning=FALSE, message=FALSE}
+#Merge the SoleBoldo datasets
+scRNA_SoleBoldo <- merge(x = scRNA_WT1, y = c(scRNA_WT2, scRNA_WT3, scRNA_WT4, scRNA_WT5), add.cell.ids = c('SB_o1', 'SB_o2', 'SB_o3', 'SB_y1', 'SB_y2'), project = 'SoleBoldo_Human_scRNA')
+scRNA_SoleBoldo#view merged Seurat object
+table(scRNA_SoleBoldo$orig.ident)#view size of each individual dataset w/in the merged Seurat object
+
+#Store mitochondrial percentage in object meta data (for later regression)
+scRNA_SoleBoldo <- PercentageFeatureSet(scRNA_SoleBoldo, pattern = "^MT-", col.name = "percent.mt")
+VlnPlot(scRNA_SoleBoldo, features = 'percent.mt'); VlnPlot(scRNA_SoleBoldo, features = 'nCount_RNA')
+
+scRNA_SoleBoldo <- subset(x = scRNA_SoleBoldo, 
+                          subset = percent.mt < 5 &
+                            nCount_RNA < 20000)#subset out cells with mitochondrial gene % >= 5% and likely doublets
+VlnPlot(scRNA_SoleBoldo, features = 'percent.mt'); VlnPlot(scRNA_SoleBoldo, features = 'nCount_RNA')
+table(scRNA_SoleBoldo$orig.ident)#view size of each individual dataset w/in the merged Seurat object after QC
+```
+
+## SCTransform (Normalize, Scale Data)
+```{r, warning=FALSE, message=FALSE}
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+tic('Running SCTransform')
+scRNA_SoleBoldo <- SCTransform(scRNA_SoleBoldo, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+scRNA_SoleBoldo <- RunPCA(scRNA_SoleBoldo, verbose = FALSE)
+ElbowPlot(scRNA_SoleBoldo, ndims = 50)
+```
+
+## UMAP (initial)
+Pick dimensions to use based on ElbowPlot above -- try to pick dimensions w/ > 1 standard deviation. In this case, up to 40 dimensions is greater than 5 standard deviations before it levels off (suggesting decline in variability).
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+tic('Running UMAP & Making DimPlots')
+#run the UMAP function using dimensions informed by elbow plot
+scRNA_SoleBoldo <- RunUMAP(scRNA_SoleBoldo, dims = 1:30, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+scRNA_SoleBoldo <- FindNeighbors(scRNA_SoleBoldo, dims = 1:30, verbose = FALSE)
+scRNA_SoleBoldo <- FindClusters(scRNA_SoleBoldo, verbose = FALSE, algorithm = 3)#default is algorithm = 1/2 (Louvain), 3 = SLM (scATAC), 4 = Leiden (not installed on server currently - need to pip install leidenalg later)
+DimPlot(scRNA_SoleBoldo, label = TRUE, pt.size = 0.5, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(scRNA_SoleBoldo, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(scRNA_SoleBoldo, group.by = 'orig.ident', pt.size = 0.5)
+#DimPlot(scRNA_SoleBoldo, label = FALSE)#no numbers on clusters, legend off to side
+toc()
+
+#Check QC Metrics on Clustering
+FeaturePlot(scRNA_SoleBoldo, features = c('nFeature_RNA', 'nCount_RNA'))
+FeaturePlot(scRNA_SoleBoldo, features = c('percent.mt'))
+```
+
+
+
+## Check Marker Gene Expression
+BMPR1A, SMAD4, and TGFB3 mark apocrine sweat glands (Li et al., 2019 in Front. Genet. DOI: 10.3389/fgene.2018.00739). High expression of tryptases (eg TPSB2/TPSAB1) associated with Mast Cells
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+## FeaturePlots: view single-cell gene expression across clusters
+GOI <- c("PDGFRA", "TWIST2", "RGS5", "ACTA2", "SOX2", "FABP4", "PECAM1", "LYVE1", "SOX10", "TTN", "PRDM1", "PPARG", "ITGA8",
+         "TYRP1", "DCT", "PTPRC", "CD86", "ICOS", "NKG7", "TPSB2", "CDH1", "KRT14", "KRT10", "KRT8", "KRT18", "ITGA6", "ITGB1", 
+         "LEF1", "PDGFRB", "VIM", "BMPR1A", "SMAD4", "TGFB3", "FGFR2", "GATA2")
+#path_out <- 'W:/Driskell Lab/Thompson et al. 2021/Data/P0 WT/RNA/All Clusters/FeaturePlot/'
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = scRNA_SoleBoldo,
+                    features = GOI[n_plot],
+                    pt.size = 0.5,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+```
+
+
+### Change Resolution
+Resolution was fine
+```{r message=FALSE, warning=FALSE}
+scRNA_SoleBoldo <- FindClusters(scRNA_SoleBoldo, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(scRNA_SoleBoldo, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(scRNA_SoleBoldo, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+```
+
+## Differential Gene Expression
+```{r}
+tic('ClusterMarker auto-export loop')#start timer
+path_out <- '~/Sean/DEG/SB2020_All/'#path to export folder
+COI <- levels(scRNA_SoleBoldo)#define the clusters you wish to know diff. gene expression of
+
+n_genes <- length(scRNA_SoleBoldo@assays[["SCT"]]@data@Dimnames[[1]])#get # of genes we will be testing
+n_loops <- 1
+while (n_loops < length(COI) + 1) {
+#Find positive markers (upregulated genes)
+cluster.markers.temp <- FindMarkers(scRNA_SoleBoldo, ident.1 = COI[n_loops], min.pct = 0.05, logfc.threshold = 0.0, assay = 'SCT', only.pos = TRUE)#iterate through the entire COI list
+#head(cluster.markers.temp, n = 30)
+cluster.markers.temp$Gene = rownames(cluster.markers.temp)#add a column for the gene name
+cluster.markers.temp$pct.2[cluster.markers.temp$pct.2 == 0] <- NA#corrects pct ratio error if pct.2=0
+cluster.markers.temp <- na.omit(cluster.markers.temp)#remove rows with NA
+cluster.markers.temp$Pct_Ratio = cluster.markers.temp$pct.1 / cluster.markers.temp$pct.2#compute ratio of how much the cluster of interest expresses compared to all other cells
+cluster.markers.temp <- cluster.markers.temp %>% dplyr::select('Gene', everything())#move gene column to the front of the dataframe
+cluster.markers.temp$'PctRatio_x_logfc' = cluster.markers.temp$Pct_Ratio * cluster.markers.temp$avg_log2FC
+cluster.markers.temp <- cluster.markers.temp[cluster.markers.temp$PctRatio_x_logfc > quantile(cluster.markers.temp$PctRatio_x_logfc, 0.95), ]#keep only the top 95% of upregulated genes in ident.1
+cluster.markers.temp <- cluster.markers.temp[order(cluster.markers.temp$PctRatio_x_logfc, decreasing = TRUE), ]#rank genes
+write.csv(cluster.markers.temp, file = paste(path_out, (n_loops-1), '_pos_markers.csv', sep = ''), row.names = FALSE)#save that cluster's markers
+
+n_loops <- n_loops + 1#track for when all clusters of one dataset have been run through
+}
+toc()#end timer
+```
+
+## Label the Clusters by Cell Type
+```{r message=FALSE, warning=FALSE}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids.all <- c('0 Lymphocyte', '1 Fibroblast', '2 Fibroblast', '3 Macrophage', '4 Fibroblast',
+                     '5 Blood Vessel', '6 Basal Krtno', '7 Upper Krtno', '8 Pericyte', '9 Macrophage', 
+                     '10 Fibroblast', '11 Immune Cell', '12 Pericyte', '13 LBV', '14 Melanocyte', 
+                     '15 Immune Cell', '16 Immune Cell', '17 Blood Vessel', '18 Krtno', '19 Immune Cell', '20 APM')
+names(new.cluster.ids.all) <- levels(scRNA_SoleBoldo)
+scRNA_SoleBoldo <- RenameIdents(scRNA_SoleBoldo, new.cluster.ids.all)
+```
+
+Save the R object
+```{r}
+save(scRNA_SoleBoldo, file = '~/Sean/Pig/Seurat_Objects/scRNA_SoleBoldo_Merged_AllClusters.RData')#final object w/ labels
+```
+
+## Recolor the UMAP clusters by cell lineage
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+path_out <- '~/Sean/Pig/SoleBoldo/'
+
+p1 <- DimPlot(scRNA_SoleBoldo, label = FALSE, pt.size = 0.5, 
+              cols = c('#900101', '#238b45', '#006d2c', '#640001', '#41ab5d',
+                     '#8c6bb1', '#0c3695', '#225ea8', '#7fcdbb', '#790001', 
+                     '#00441b', '#AD0000', '#4db89f', '#88419d', '#fc8d59', 
+                     '#BB0000', '#cc0000', '#7850a7', '#4572aa', '#DD0000', '#f768a1')) + NoLegend()#APM pink
+p1
+
+
+p2 <- DimPlot(scRNA_SoleBoldo, label = FALSE, pt.size = 0.5, group.by = 'orig.ident',
+              cols = c('#9b7562', '#6bad79', '#4c92fe', '#755bc6', '#faa71e'))#recolored by sample
+p2
+
+p3 <- DimPlot(scRNA_SoleBoldo, label = FALSE, pt.size = 0.5, group.by = 'orig.ident',
+              cols = c('#9b7562', '#6bad79', '#4c92fe', '#755bc6', '#faa71e')) + NoLegend()#recolored by sample
+p3
+#ggsave(plot = p1, filename = 'SoleBoldo Human Adult UMAP (All Clusters).png', path = path_out,
+#         width = 7, height = 7, units = 'in')
+#ggsave(plot = p3, filename = 'SoleBoldo Human Adult UMAP (All Clusters, bySample).png', path = path_out,
+#         width = 7, height = 7, units = 'in')
+```
+
+
+#2. Subset the Keratinocytes
+```{r message=FALSE, warning=FALSE}
+scRNA_SoleBoldo_krtno <- subset(scRNA_SoleBoldo, idents = c('7 Upper Krtno', '6 Basal Krtno', '18 Krtno'),
+                                invert = FALSE)#subset the keratinocyte supercluster
+scRNA_SoleBoldo_krtno#view the subset
+## We want to renormalize the data to bring out the heterogenetiy within the lineage
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+tic('Running SCTransform')
+scRNA_SoleBoldo_krtno <- SCTransform(scRNA_SoleBoldo_krtno, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+scRNA_SoleBoldo_krtno <- RunPCA(scRNA_SoleBoldo_krtno, verbose = FALSE)
+ElbowPlot(scRNA_SoleBoldo_krtno, ndims = 50)
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+scRNA_SoleBoldo_krtno <- RunUMAP(scRNA_SoleBoldo_krtno, dims = 1:15, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:40) can represent subtle but relevant sources of heterogeneity
+scRNA_SoleBoldo_krtno <- FindNeighbors(scRNA_SoleBoldo_krtno, dims = 1:15, verbose = FALSE)
+scRNA_SoleBoldo_krtno <- FindClusters(scRNA_SoleBoldo_krtno, verbose = FALSE, algorithm = 3, resolution = 0.8)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(scRNA_SoleBoldo_krtno, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1.0) + NoLegend()#no labels
+DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1.0, group.by = 'orig.ident')#colored by sample
+```
+
+### View expression of markers
+Solé-Boldo et al.'s immunostaining showed APOE expression in the epidermis (a control)
+Watt JID review: DLL1/LRIG1 in stem cells, Col17A1 in between rete ridges
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+## FeaturePlots: view single-cell gene expression across clusters
+DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1.0, group.by = 'orig.ident')#colored by sample
+DimPlot(scRNA_SoleBoldo_krtno, label = TRUE, pt.size = 1.0, label.size = 6.0)
+
+GOI <- c('APOE', 'KRT14', 'KRT5', 'KRT1', 'KRT10', 'KRT18', 'KRT8', 'CALML5', 'CNFN', 'DCT', 'CDH1',
+         'TOP2A', 'ASPM', 'ITGA6', 'ITGB1', 'SOX6', 'COL17A1', 'VAMP1', 'SOX9', 'KRT15', 'ITGB4', 'SLC1A3', 'SOSTDC1', 'LGR5', 'LGR6', 
+         'VEGFA', 'DLL1', 'CAV1', 'DUSP6', 'VIM', 'nFeature_SCT')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = scRNA_SoleBoldo_krtno,
+                    features = GOI[n_plot],
+                    pt.size = 0.8,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+scRNA_SoleBoldo_krtno <- FindClusters(scRNA_SoleBoldo_krtno, verbose = FALSE,
+                                            algorithm = 3, resolution = 0.8)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(scRNA_SoleBoldo_krtno, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+```
+
+# Differential Gene Expression Within Keratinocytes
+```{r}
+tic('ClusterMarker auto-export loop')#start timer
+path_out <- '~/Sean/Pig/SoleBoldo/Krtno_DEG/All_Krtno/'#path to export folder
+COI <- c('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12', '13')#define the clusters you wish to know diff. gene expression of
+
+n_genes <- length(scRNA_SoleBoldo_krtno@assays[["SCT"]]@data@Dimnames[[1]])#get # of genes we will be testing
+n_loops <- 1
+while (n_loops < length(COI) + 1) {
+#Find positive markers (upregulated genes)
+cluster.markers.temp <- FindMarkers(scRNA_SoleBoldo_krtno, ident.1 = COI[n_loops], min.pct = 0.05, logfc.threshold = 0.0, assay = 'SCT', only.pos = TRUE)#iterate through the entire COI list
+#head(cluster.markers.temp, n = 30)
+cluster.markers.temp$Gene = rownames(cluster.markers.temp)#add a column for the gene name
+cluster.markers.temp$pct.2[cluster.markers.temp$pct.2 == 0] <- NA#corrects pct ratio error if pct.2=0
+cluster.markers.temp <- na.omit(cluster.markers.temp)#remove rows with NA
+cluster.markers.temp$Pct_Ratio = cluster.markers.temp$pct.1 / cluster.markers.temp$pct.2#compute ratio of how much the cluster of interest expresses compared to all other cells
+cluster.markers.temp <- cluster.markers.temp %>% dplyr::select('Gene', everything())#move gene column to the front of the dataframe
+cluster.markers.temp$'PctRatio_x_logfc' = cluster.markers.temp$Pct_Ratio * cluster.markers.temp$avg_log2FC
+cluster.markers.temp <- cluster.markers.temp[cluster.markers.temp$PctRatio_x_logfc > quantile(cluster.markers.temp$PctRatio_x_logfc, 0.95), ]#keep only the top 95% of upregulated genes in ident.1
+cluster.markers.temp <- cluster.markers.temp[order(cluster.markers.temp$PctRatio_x_logfc, decreasing = TRUE), ]#rank genes
+write.csv(cluster.markers.temp, file = paste(path_out, COI[n_loops], '_pos_markers.csv', sep = ''), row.names = FALSE)#save that cluster's markers
+
+n_loops <- n_loops + 1#track for when all clusters of one dataset have been run through
+}
+toc()#end timer
+```
+
+## Label the Clusters by Cell Type
+```{r message=FALSE, warning=FALSE}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids.all <- c('0 Basal Krtno', '1 Basal Krtno', '2 Diff Krtno', '3 Diff Krtno', '4 Div Krtno',
+                     '5 Rete', '6 Diff Krtno', '7 Sweat Gland', '8 Spinous Krtno', '9 SOX5 Krtno', 
+                     '10 KRT8_18 Krtno', '11 Immune Cell', '12 Sox9 Krtno', '13 Langerhans Cell')
+names(new.cluster.ids.all) <- levels(scRNA_SoleBoldo_krtno)
+scRNA_SoleBoldo_krtno <- RenameIdents(scRNA_SoleBoldo_krtno, new.cluster.ids.all)
+```
+
+Save the R object
+```{r}
+save(scRNA_SoleBoldo_krtno, file = '~/Sean/Pig/Seurat_Objects/scRNA_SoleBoldo_Krtno_sub.RData')#final object w/ labels
+```
+
+##Fig Quality DimPlot
+```{r fig.height=7, fig.width=7}
+DimPlot(scRNA_SoleBoldo_krtno, label = TRUE, pt.size = 1.0, label.size = 6,
+        cols = c('#0c3695', '#2c72c8', '#f09527', '#f0b627', 
+                 '#107de9', '#00206a', '#ff692b', '#1a9850', 
+                 '#d04800', '#6b92c3', '#8c6bb1', '#ef3b2c', 
+                 '#225ea8', '#a50f15'))#legend
+DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1.0,
+        cols = c('#0c3695', '#2c72c8', '#f09527', '#f0b627', 
+                 '#107de9', '#00206a', '#ff692b', '#1a9850', 
+                 '#d04800', '#6b92c3', '#8c6bb1', '#ef3b2c', 
+                 '#225ea8', '#a50f15')) + NoLegend()#blank
+DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1, group.by = 'orig.ident',
+              cols = c('#9b7562', '#6bad79', '#4c92fe', '#755bc6', '#faa71e')) + NoLegend()#recolored by sample
+DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1, group.by = 'orig.ident',
+              cols = c('#9b7562', '#6bad79', '#4c92fe', '#755bc6', '#faa71e'))#recolored by sample
+```
+
+## Recolor the UMAP clusters by cell lineage
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Desktop/Sean_CellChat/UMAP/'
+p1 <- DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1.0,
+        cols = c('#0c3695', '#2c72c8', '#f09527', '#f0b627', 
+                 '#107de9', '#00206a', '#ff692b', '#1a9850', 
+                 '#d04800', '#6b92c3', '#8c6bb1', '#ef3b2c', 
+                 '#225ea8', '#a50f15')) + NoLegend()#blank
+p1
+ggsave(plot = p1, filename = 'SoleBoldo2020 UMAP (Krtno).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(scRNA_SoleBoldo_krtno, label = FALSE, pt.size = 1.0, group.by = 'orig.ident',
+              cols = c('#9b7562', '#6bad79', '#4c92fe', '#755bc6', '#faa71e')) + NoLegend()#recolored by sample
+p1
+ggsave(plot = p1, filename = 'SoleBoldo2020 (Krtno, bySample).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+```
+
+#3b. Subset the Keratinocytes Only
+```{r message=FALSE, warning=FALSE}
+SB2020_krtno_sub <- subset(scRNA_SoleBoldo_krtno, idents = c('0 Basal Krtno', '1 Basal Krtno', '2 Diff Krtno', '3 Diff Krtno', '4 Div Krtno',
+                                                                  '5 Rete', '6 Diff Krtno', '8 Spinous Krtno', '9 SOX5 Krtno', '12 Sox9 Krtno'),
+                                invert = FALSE)#subset the keratinocytes
+SB2020_krtno_sub#view the subset
+## We want to renormalize the data to bring out the heterogenetiy within the lineage
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+tic('Running SCTransform')
+SB2020_krtno_sub <- SCTransform(SB2020_krtno_sub, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+SB2020_krtno_sub <- RunPCA(SB2020_krtno_sub, verbose = FALSE)
+ElbowPlot(SB2020_krtno_sub, ndims = 50)
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+SB2020_krtno_sub <- RunUMAP(SB2020_krtno_sub, dims = 1:30, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:40) can represent subtle but relevant sources of heterogeneity
+SB2020_krtno_sub <- FindNeighbors(SB2020_krtno_sub, dims = 1:30, verbose = FALSE)
+SB2020_krtno_sub <- FindClusters(SB2020_krtno_sub, verbose = FALSE, algorithm = 3, resolution = 0.8)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(SB2020_krtno_sub, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(SB2020_krtno_sub, label = FALSE, pt.size = 1.0) + NoLegend()#no labels
+DimPlot(SB2020_krtno_sub, label = FALSE, pt.size = 1.0, group.by = 'orig.ident')#colored by sample
+```
+
+### View expression of markers
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+## FeaturePlots: view single-cell gene expression across clusters
+DimPlot(SB2020_krtno_sub, label = FALSE, pt.size = 1.0, group.by = 'orig.ident')#colored by sample
+DimPlot(SB2020_krtno_sub, label = TRUE, pt.size = 1.0, label.size = 6.0)
+
+GOI <- c('KRT15', 'KRT14', 'KRT5', 'KRT10', 'KRT1', 'KRT8', 'KRT18', 'CALML5', 'CNFN', 'CDH1', 'LRIG1',
+         'MKI67', 'ITGA6', 'ITGB4', 'SOX6', 'SOX5', 'SOSTDC1', 'COL17A1', 'SOX9', 'VEGFA', 'ANGPTL4', 'PDGFC', 'TGFBI', 'TGFB2', 'CXCL14', 
+         'LEF1', 'DLK2', 'DLL1', 'JAG1', 'NOTCH3',
+         'DUSP6', 'CAV1', 'ASS1', 'VIM', 'PTPRC', 'PDGFRA', 'percent.mt', 'nCount_SCT', 'KRT17', 'SBSN', 'AXIN2', 'WNT16', 'PHLDB2')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = SB2020_krtno_sub,
+                    features = GOI[n_plot],
+                    pt.size = 1.5,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+SB2020_krtno_sub <- FindClusters(SB2020_krtno_sub, verbose = FALSE,
+                                            algorithm = 3, resolution = 0.7)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(SB2020_krtno_sub, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(SB2020_krtno_sub, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+DimPlot(SB2020_krtno_sub, label = FALSE, pt.size = 1.0, group.by = 'orig.ident')#no labels (to label in photoshop)
+```
+
+# Differential Gene Expression Within Keratinocytes
+```{r}
+tic('ClusterMarker auto-export loop')#start timer
+path_out <- '~/Sean/DEG/Krtno_sub/SB2020/'#path to export folder
+COI <- c('0', '1', '2', '3', '4', '5', '6', '7', '8', '9')#define the clusters you wish to know diff. gene expression of
+
+n_genes <- length(SB2020_krtno_sub@assays[["SCT"]]@data@Dimnames[[1]])#get # of genes we will be testing
+n_loops <- 1
+while (n_loops < length(COI) + 1) {
+#Find positive markers (upregulated genes)
+cluster.markers.temp <- FindMarkers(SB2020_krtno_sub, ident.1 = COI[n_loops], min.pct = 0.05, logfc.threshold = 0.0, assay = 'SCT', only.pos = TRUE)#iterate through the entire COI list
+#head(cluster.markers.temp, n = 30)
+cluster.markers.temp$Gene = rownames(cluster.markers.temp)#add a column for the gene name
+cluster.markers.temp$pct.2[cluster.markers.temp$pct.2 == 0] <- NA#corrects pct ratio error if pct.2=0
+cluster.markers.temp <- na.omit(cluster.markers.temp)#remove rows with NA
+cluster.markers.temp$Pct_Ratio = cluster.markers.temp$pct.1 / cluster.markers.temp$pct.2#compute ratio of how much the cluster of interest expresses compared to all other cells
+cluster.markers.temp <- cluster.markers.temp %>% dplyr::select('Gene', everything())#move gene column to the front of the dataframe
+cluster.markers.temp$'PctRatio_x_logfc' = cluster.markers.temp$Pct_Ratio * cluster.markers.temp$avg_log2FC
+cluster.markers.temp <- cluster.markers.temp[cluster.markers.temp$PctRatio_x_logfc > quantile(cluster.markers.temp$PctRatio_x_logfc, 0.95), ]#keep only the top 95% of upregulated genes in ident.1
+cluster.markers.temp <- cluster.markers.temp[order(cluster.markers.temp$PctRatio_x_logfc, decreasing = TRUE), ]#rank genes
+write.csv(cluster.markers.temp, file = paste(path_out, COI[n_loops], '_pos_markers.csv', sep = ''), row.names = FALSE)#save that cluster's markers
+
+n_loops <- n_loops + 1#track for when all clusters of one dataset have been run through
+}
+toc()#end timer
+```
+
+## Label the Clusters by Cell Type
+```{r message=FALSE, warning=FALSE}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids.all <- c('0 Basal Krtno', '1 Suprabasal Krtno', '2 Diff Krtno', '3 Diff Krtno', '4 Basal Krtno',
+                     '5 Diff Krtno', '6 Basal Krtno', '7 SOX5 Krtno', '8 Spinous Krtno', '9 SOX9 Krtno')
+names(new.cluster.ids.all) <- levels(SB2020_krtno_sub)
+SB2020_krtno_sub <- RenameIdents(SB2020_krtno_sub, new.cluster.ids.all)
+```
+
+Save the R object
+```{r}
+save(SB2020_krtno_sub, file = '/media/sean/T2TB/Object/scRNA_SoleBoldo_Krtno_sub_v1.RData')#final object w/ labels
+```
+
+##Fig Quality DimPlot
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Sean/UMAP/'
+p1 <- DimPlot(SB2020_krtno_sub, label = FALSE, pt.size = 2.0,
+        cols = c('#2353c1', '#107de9', '#ff692b', '#f0b627', '#0c3695', 
+                 '#f09527', '#225ea8', '#ffab4b', '#d04800', '#00206a')) + NoLegend()#blank
+
+p1
+#ggsave(plot = p1, filename = 'SoleBoldo2020 UMAP (Krtno sub).png', path = path_out,
+#         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(SB2020_krtno_sub, label = FALSE, pt.size = 1.5, group.by = 'orig.ident',
+              cols = c('#9b7562', '#6bad79', '#4c92fe', '#755bc6', '#faa71e')) + NoLegend()#recolored by sample
+p1
+#ggsave(plot = p1, filename = 'SoleBoldo2020 (Krtno sub, bySample).png', path = path_out,
+#         width = 7, height = 7, units = 'in')
+```
+

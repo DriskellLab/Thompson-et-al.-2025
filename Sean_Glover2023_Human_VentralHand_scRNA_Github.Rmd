@@ -1,0 +1,251 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#0. Load packages
+```{r}
+library(dplyr)
+library(Seurat)
+library(tictoc)
+library(reticulate)
+library(limma)#from Biocmanager
+library(ggplot2)
+library(viridisLite)
+library(patchwork)
+library(future)
+library(tictoc)
+plan('multisession', workers = 5)#cores = 5
+options(future.globals.maxSize = 100000 * 1024^2)
+
+#install.packages('textshaping')#needed ~"sudo apt install libharfbuzz-dev libfribidi-dev" first
+#install.packages('Cairo)#needed ~"sudo apt install libxt-dev", ~"sudo apt-get install libcairo2-dev" first
+#install.packages('units')#needed ~"sudo apt-get install libudunits2-dev" first
+#install.packages('ragg')#needed ~"libfreetype6-dev libpng-dev libtiff5-dev libjpeg-dev" first
+#install.packages('terra')#needed ~"sudo apt-get install gdal-bin libgdal-dev" first
+#install.packages('sf')#
+#install.packages('spdep')#
+#install.packages('ggrastr')#
+
+library(monocle3)#installed via devtools::install_github('cole-trapnell-lab/monocle3')
+library(Seurat)
+library(SeuratWrappers)#installed via remotes::install_github('satijalab/seurat-wrappers')
+library(patchwork)
+library(ggplot2)
+#library(dplyr)
+set.seed(1234)
+```
+
+# Citation for scRNA-seq datasets
+Glover et al. 2023. The developmental basis of fingerprint pattern formation and variation. Cell, Volume 186, Issue 5, 940 - 956.e20. DOI: 10.1016/j.cell.2023.01.015
+
+#Load data
+```{r}
+# Load the D10 dataset
+donor1.data <- Read10X("~/Documents/Glover2023/VentralHand1(GSM5844682)/")
+donor2.data <- Read10X("~/Documents/Glover2023/VentralHand2(GSM5844685)/")
+
+# Initialize the Seurat object with the raw (non-normalized data).
+donor1 <- CreateSeuratObject(counts = donor1.data, project = "Ventral1", min.cells = 3, min.features = 200)
+donor2 <- CreateSeuratObject(counts = donor2.data, project = "Ventral2", min.cells = 3, min.features = 200)
+  
+donor1
+donor2
+
+Glover2023 <- merge(x = donor1, y = c(donor2), add.cell.ids = c('V1', 'V2'), project = 'Glover2023_Human_Ventral')
+#Glover2023 <- donor1
+```
+
+#QC
+```{r}
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+Glover2023[["percent.mt"]] <- PercentageFeatureSet(Glover2023, pattern = "^MT")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(Glover2023, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+VlnPlot(Glover2023, features = c("nCount_RNA")) + ylim(0, 10000)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(Glover2023, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(Glover2023, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+```
+
+#QC Filter
+```{r}
+Glover2023 <- subset(x = Glover2023, 
+                          subset = nCount_RNA > 1250 &
+                            nCount_RNA < 10000)
+Glover2023
+
+# Visualize QC metrics as a violin plot
+VlnPlot(Glover2023, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+```
+
+## SCTransform (Normalize, Scale Data)
+```{r, warning=FALSE, message=FALSE}
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+tic('Running SCTransform')
+Glover2023 <- SCTransform(Glover2023, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+Glover2023 <- RunPCA(Glover2023, verbose = FALSE)
+ElbowPlot(Glover2023, ndims = 50)
+```
+
+## UMAP (initial)
+Pick dimensions to use based on ElbowPlot above -- try to pick dimensions w/ > 1 standard deviation. In this case, up to 40 dimensions is greater than 5 standard deviations before it levels off (suggesting decline in variability).
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAP & Making DimPlots')
+#run the UMAP function using dimensions informed by elbow plot
+Glover2023 <- RunUMAP(Glover2023, dims = 1:30, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+Glover2023 <- FindNeighbors(Glover2023, dims = 1:30, verbose = FALSE)
+Glover2023 <- FindClusters(Glover2023, verbose = FALSE, algorithm = 3)#default is algorithm = 1/2 (Louvain), 3 = SLM (scATAC), 4 = Leiden (not installed on server currently - need to pip install leidenalg later)
+DimPlot(Glover2023, label = TRUE, pt.size = 0.5, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Glover2023, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(Glover2023, group.by = 'orig.ident', pt.size = 0.5)
+#DimPlot(Glover2023, label = FALSE)#no numbers on clusters, legend off to side
+toc()
+
+#Check QC Metrics on Clustering
+FeaturePlot(Glover2023, features = c('nFeature_RNA', 'nCount_RNA'))
+FeaturePlot(Glover2023, features = c('percent.mt'))
+```
+
+#FeaturePlot
+```{r message=FALSE, warning=FALSE}
+## FeaturePlots: view single-cell gene expression across clusters
+GOI <- c("PDGFRA", "FGF20", "PECAM1", "SOX10", "PTPRC", "CD86", "KRT14", "KRT10", "KRT8", "KRT18", "KRT15", 'CALML5', 'CNFN', "ITGA6", "ITGB4", 
+         "LEF1", "EDAR", "WNT10B", "PTCH1", "PTCH2", "VIM", "SOX6", "SOX9", "COL17A1", "PTPRC", "ALAS2", "VEGFA", "COL1A1", "ACTA2", "TOP2A", "PDGFA", "EDA", "TGFA", "LMX1A")
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = Glover2023,
+                    features = GOI[n_plot],
+                    pt.size = 0.3,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+```
+
+### Change Resolution
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+Glover2023 <- FindClusters(Glover2023, verbose = FALSE, algorithm = 3, resolution = 0.2)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(Glover2023, label = TRUE, pt.size = 0.5, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Glover2023, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(Glover2023, label = FALSE, pt.size = 0.5, group.by = 'orig.ident')#no labels (to label in photoshop)
+```
+
+### Change Resolution
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+Glover2023 <- FindClusters(Glover2023, verbose = FALSE, algorithm = 3, resolution = 0.2)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(Glover2023, label = TRUE, pt.size = 0.5, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Glover2023, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(Glover2023, label = FALSE, pt.size = 0.5, group.by = 'orig.ident')#no labels (to label in photoshop)
+```
+
+Save the R object
+```{r}
+save(Glover2023, file = '~/Desktop/Sean_CellChat/Object/Glover2023_Ventral_AllClusters.RData')#final object w/ labels
+```
+
+#2. Subset Keratinocytes
+```{r}
+Glover2023_krtno <- subset(Glover2023, idents = c('1', '2'), invert = FALSE)#subset the keratinocyte clusters
+Glover2023_krtno#view the subset
+```
+
+#scTransform
+```{r}
+tic('Running SCTransform')
+Glover2023_krtno <- SCTransform(Glover2023_krtno, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+Glover2023_krtno <- RunPCA(Glover2023_krtno, verbose = FALSE)
+ElbowPlot(Glover2023_krtno, ndims = 50)
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+Glover2023_krtno <- RunUMAP(Glover2023_krtno, dims = 1:30, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+Glover2023_krtno <- FindNeighbors(Glover2023_krtno, dims = 1:30, verbose = FALSE)
+Glover2023_krtno <- FindClusters(Glover2023_krtno, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(Glover2023_krtno, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Glover2023_krtno, label = FALSE, pt.size = 1.0) + NoLegend()#no labels
+DimPlot(Glover2023_krtno, label = FALSE, pt.size = 1.0, group.by = 'orig.ident')#colored by sample
+```
+
+#FeaturePlot
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+## FeaturePlots: view single-cell gene expression across clusters
+GOI <- c("FGF20", "KRT14", "KRT10", "CNFN", "KRT15", "ITGA6", "ITGB4", 
+         "LEF1", "EDAR", "WNT10B", "PTCH1", "PTCH2", "SOX6", "SOX9", "COL17A1", "VEGFA", "TOP2A", "PDGFA", "EDA", "EN1", "TGFA", "LMX1A", "KRT8", "KRT18", "KRT19")
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = Glover2023_krtno,
+                    features = GOI[n_plot],
+                    pt.size = 0.5,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+Glover2023_krtno <- FindClusters(Glover2023_krtno, verbose = FALSE, algorithm = 3, resolution = 0.3)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(Glover2023_krtno, label = TRUE, pt.size = 0.5, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Glover2023_krtno, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(Glover2023_krtno, label = FALSE, pt.size = 0.5, group.by = 'orig.ident')#no labels (to label in photoshop)
+```
+
+##Figure quality UMAP
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Desktop/Sean_CellChat/UMAP/'
+DimPlot(Glover2023_krtno, label = TRUE, pt.size = 2, label.size = 6,
+        cols = c('#0c3695', '#00206a', '#f0b627', '#ff692b', '#4d8ad5', '#8c6bb1'))#legend
+p1 <- DimPlot(Glover2023_krtno, label = FALSE, pt.size = 2,
+        cols = c('#0c3695', '#00206a', '#f0b627', '#ff692b', '#4d8ad5', '#8c6bb1')) + NoLegend()#blank
+p1
+
+ggsave(plot = p1, filename = 'Glover2023 Human Ventral1_2 UMAP (Keratinocytes).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+```
+
+Save the R object
+```{r}
+save(Glover2023_krtno, file = '/t2tb/Object/Glover2023_Ventral_Krtno.RData')
+```
+
+

@@ -1,0 +1,379 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#0. Load packages
+```{r}
+library(dplyr)
+library(Seurat)
+library(tictoc)
+library(reticulate)
+library(limma)#from Biocmanager
+library(viridisLite)
+library(patchwork)
+library(future)
+plan('multisession', workers = 5)#cores = 5
+options(future.globals.maxSize = 100000 * 1024^2)
+
+library(CellChat)#install BiocNeighbors using BiocManager
+library(patchwork)
+options(stringsAsFactors = FALSE)
+
+```
+
+#1. Subset to Basal Krtno & Upper Dermis (Epidermal-dermal interactions prior to dermal pocket formation)
+Using updated CellChat V2
+```{r}
+##Subset
+
+E90_cc <- subset(e90, idents = c('0 Basal Krtno', '4 PF', '7 Div Krtno', '9 BV', '12 Pericyte', '23 LV'), invert = FALSE)#subset
+E90_cc#view the subset
+
+##Rename clusters to their #'s since this cleans up the CellChat plots
+cluster_names <- c('BK', '4', '7', '9', '12', '23')
+#cluster_names <- as.data.frame(strsplit2(x = cluster_names, split = ' '))#cellchat can't have clusters w/ 0 in id
+
+new.cluster.ids <- cluster_names
+table(new.cluster.ids)
+names(new.cluster.ids) <- levels(E90_cc)
+E90_cc <- RenameIdents(E90_cc, new.cluster.ids)
+```
+
+#Initialize cellchat object and db
+```{r}
+data.input <- GetAssayData(E90_cc, assay = "SCT", slot = "data") # normalized data matrix
+labels <- Idents(E90_cc)
+meta <- data.frame(group = labels, row.names = names(labels)) # create a dataframe of the cell labels
+
+
+cellchat <- createCellChat(object = data.input, meta = meta, group.by = "group")
+#> Create a CellChat object from a data matrix
+#> Set cell identities for the new CellChat object
+#> The cell groups used for CellChat analysis are  APOE+ FIB FBN1+ FIB COL11A1+ FIB Inflam. FIB cDC1 cDC2 LC Inflam. DC TC Inflam. TC CD40LG+ TC NKT
+#> 
+#> cellchat <- addMeta(cellchat, meta = meta)
+cellchat <- setIdent(cellchat, ident.use = "group") # set "labels" as default cell identity
+levels(cellchat@idents) # show factor levels of the cell labels
+groupSize <- as.numeric(table(cellchat@idents)) # number of cells in each cell group
+
+#__________________________________________________________________________________________________
+CellChatDB <- CellChatDB.human # use CellChatDB.mouse if running on mouse data
+showDatabaseCategory(CellChatDB)
+
+# Show the structure of the database
+dplyr::glimpse(CellChatDB$interaction)
+#> Rows: 1,939
+#> Columns: 11
+#> $ interaction_name   <chr> "TGFB1_TGFBR1_TGFBR2", "TGFB2_TGFBR1_TGFBR2", "TGFB…
+#> $ pathway_name       <chr> "TGFb", "TGFb", "TGFb", "TGFb", "TGFb", "TGFb", "TG…
+#> $ ligand             <chr> "TGFB1", "TGFB2", "TGFB3", "TGFB1", "TGFB1", "TGFB2…
+#> $ receptor           <chr> "TGFbR1_R2", "TGFbR1_R2", "TGFbR1_R2", "ACVR1B_TGFb…
+#> $ agonist            <chr> "TGFb agonist", "TGFb agonist", "TGFb agonist", "TG…
+#> $ antagonist         <chr> "TGFb antagonist", "TGFb antagonist", "TGFb antagon…
+#> $ co_A_receptor      <chr> "", "", "", "", "", "", "", "", "", "", "", "", "",…
+#> $ co_I_receptor      <chr> "TGFb inhibition receptor", "TGFb inhibition recept…
+#> $ evidence           <chr> "KEGG: hsa04350", "KEGG: hsa04350", "KEGG: hsa04350…
+#> $ annotation         <chr> "Secreted Signaling", "Secreted Signaling", "Secret…
+#> $ interaction_name_2 <chr> "TGFB1 - (TGFBR1+TGFBR2)", "TGFB2 - (TGFBR1+TGFBR2)…
+
+```
+
+#Select the database to use downstream
+```{r}
+# use a subset of CellChatDB for cell-cell communication analysis
+#CellChatDB.use <- subsetDB(CellChatDB, search = "Secreted Signaling") # use just Secreted Signaling
+# use all CellChatDB for cell-cell communication analysis
+CellChatDB.use <- CellChatDB
+
+# set the used database in the object
+cellchat@DB <- CellChatDB.use
+#__________________________________________________________________________________________________
+
+# subset the expression data of signaling genes for saving computation cost
+cellchat <- subsetData(cellchat) # This step is necessary even if using the whole database
+
+```
+
+#Compute the communication probability and infer cellular communication network
+```{r}
+tic("Identifying overexpressed genes and interactions")
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)#population.size = TRUE?
+
+toc()
+# project gene expression data onto PPI (Optional: when running it, USER should set `raw.use = FALSE` in the function `computeCommunProb()` in order to use the projected data)
+# cellchat <- projectData(cellchat, PPI.human)
+```
+
+#Calculate Interactions At the Community Level (Longest Step)
+```{r fig.height=7, fig.width=7}
+tic("Computing Communities")
+
+cellchat <- computeCommunProb(cellchat)
+# Filter out the cell-cell communication if there are only few number of cells in certain cell groups
+cellchat <- filterCommunication(cellchat, min.cells = 3)#we have some small clusters I want to keep
+
+cellchat <- computeCommunProbPathway(cellchat)
+toc()
+
+
+cellchat <- aggregateNet(cellchat)
+```
+
+```{r}
+groupSize <- as.numeric(table(cellchat@idents))
+par(mfrow = c(1,2), xpd=TRUE)
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, weight.scale = T, label.edge= F, title.name = "Number of interactions")
+
+```
+
+Save Cellchat object now
+```{r}
+save(cellchat, file = '/media/sean/T2TB/Object/E90_Pig_cellchat_v2_refined_noBB.Rdata')
+```
+
+#If loading from saved CellChat object:
+```{r}
+groupSize <- as.numeric(table(cellchat@idents)) # number of cells in each cell group
+```
+
+#Compute the contribution of each ligand-receptor pair to the overall signaling pathway and visualize cell-cell communication mediated by a single ligand-receptor pair
+```{r}
+pathways.show <- cellchat@netP$pathways#store pathways with significant communication
+pathways.show#print to notebook the pathways
+
+#view contribution of each pathways's ligand receptor pairs
+n_loop <- 1#storage variable to iterate through
+while (n_loop <= length(pathways.show)) {
+  p1 <- netAnalysis_contribution(cellchat, signaling = pathways.show[n_loop]) + 
+    ggtitle(pathways.show[n_loop])#want to view one pathway at a time
+  print(p1)
+  
+  n_loop <- n_loop + 1#iterate to next pathway
+}
+
+#netAnalysis_contribution(cellchat, signaling = pathways.show)#view all pathways
+```
+
+#Sender-Receiver Networks
+```{r}
+#load in saved cellchat object if starting here
+load("/media/sean/T2TB/Object/E90_Pig_cellchat_v2_refined.Rdata")
+cellchat_e90_noBB <- cellchat
+```
+
+##Set Cluster Order for Heatmaps
+```{r}
+#cellchat_e90_noBB@idents <- factor(cellchat_e90_noBB@idents, levels = c('BK', '7', '4', '12', '9', '23')) # show factor levels of the cell labels
+cellchat_e90_noBB <- updateClusterLabels(cellchat_e90_noBB, new.order = c('BK', '7', '4', '12', '9', '23'))
+umap_cols <- c('#002783', '#64a7e9', '#41ab5d', '#16539e', '#00441b', 
+                     '#0c6395', '#006837', '#2565b5', '#a1d99b', '#8c6bb1', 
+                     '#238b45', '#1179a3', '#7fcdbb', '#790001', '#96ccff', 
+                     '#f768a1', '#00206a', '#bdbdbd', '#ae017e', '#ffab4b', 
+                     '#cc0000', '#BB0000', '#164c9a', '#88419d', '#fc8d59')#string vector of my custom colors for UMAP
+umap_cols <- c('#002783', '#2565b5', '#00441b','#7fcdbb', '#8c6bb1', '#88419d')#reorder to match the reordered clusters
+names(umap_cols) <- umap_cols#Cellchat V2.0+ requires named color vector for manual coloring, not needed in my original analyses in V1
+
+```
+
+save the ordered cellchat object
+```{r}
+save(cellchat_e90_noBB, file = '/media/sean/T2TB/Object/e90_cellchat_epi_der_ordered_noBB.Rdata')
+```
+
+```{r}
+load('/media/sean/T2TB/Object/e90_cellchat_epi_der_ordered_noBB.Rdata')
+```
+
+#re-initialize common inputs if necessary
+```{r}
+groupSize <- as.numeric(table(cellchat_e90_noBB@idents)) # number of cells in each cell group
+pathways.show <- cellchat_e90_noBB@netP$pathways#store pathways with significant communication
+mat <- cellchat_e90_noBB@net$weight
+
+#umap_cols <- c('#002783', '#64a7e9', '#41ab5d', '#16539e', '#00441b', 
+#                     '#0c6395', '#006837', '#2565b5', '#a1d99b', '#8c6bb1', 
+#                     '#238b45', '#1179a3', '#7fcdbb', '#790001', '#96ccff', 
+#                     '#f768a1', '#00206a', '#bdbdbd', '#ae017e', '#ffab4b', 
+#                     '#cc0000', '#BB0000', '#164c9a', '#88419d', '#fc8d59')
+#
+#cols_i <- as.numeric(levels(E90_cc))
+#cols_i[1] <- 0#since cellchat can't take 0 as a cluster id, now need to replace 'chr_id' --> NA from as.numeric w/ 0 for initial cluster
+#umap_cols <- umap_cols[cols_i + 1]
+#names(umap_cols) <- umap_cols#Cellchat V2.0+ requires named color vector for manual coloring, not needed in my original analyses in V1
+
+umap_cols <- c('#002783', '#2565b5', '#00441b','#7fcdbb', '#8c6bb1', '#88419d')#reorder to match the reordered clusters
+names(umap_cols) <- umap_cols#Cellchat V2.0+ requires named color vector for manual coloring, not needed in my original analyses in V1
+
+```
+
+#View CirclePlot of overall interactions between clusters
+```{r fig.height=10, fig.width=10}
+path_out <- '~/Sean/Plots/E90_EpiDer_Refined/Ordered_noBB/Cluster_CirclePlot/'
+setwd(path_out)#need to change working directory to export plots b/c the plot is not a ggplot object
+
+
+par(mfrow = c(3,4), xpd=TRUE)
+for (i in 1:nrow(mat)) {
+  mat2 <- matrix(0, nrow = nrow(mat), ncol = ncol(mat), dimnames = dimnames(mat))
+  mat2[i, ] <- mat[i, ]
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i], color.use = umap_cols)
+  
+  #use png graphics device to export the cellchat plots (gives control over dimensions and naming versus netVisual function)
+  png(filename = paste0(rownames(mat)[i], ' Interactions.png', sep = ''),
+      width = 7, height = 7, units = 'in', res = 300)#start graphics device
+  netVisual_circle(mat2, vertex.weight = groupSize, weight.scale = T, edge.weight.max = max(mat), title.name = rownames(mat)[i], color.use = umap_cols)
+  dev.off()
+}
+
+
+setwd('~/Sean/RNotebooks')
+```
+
+#View CirclePlot of overall pathway interactions
+```{r fig.height=5, fig.width=7}
+# Hierarchy plot
+vertex.receiver = seq(1,4) # a numeric vector.
+path_out <- '~/Sean/Plots/E90_EpiDer_Refined/Ordered_noBB/Path_CirclePlot/'
+setwd(path_out)#need to change working directory to export plots b/c the plot is not a ggplot object
+
+n_loop <- 1#storage variable to iterate through
+while (n_loop <= length(pathways.show)) {
+  netVisual_aggregate(cellchat_e90_noBB, signaling = pathways.show[n_loop],  vertex.receiver = vertex.receiver,
+                      show.legend = FALSE, thresh = 0.01, color.use = umap_cols,
+                      arrow.size = 1, arrow.width = 1.5,)#want to view one pathway at a time
+  
+  #use png graphics device to export the cellchat plots (gives control over dimensions and naming versus netVisual function)
+  png(filename = paste0(pathways.show[n_loop], '.png', sep = ''),
+      width = 7, height = 7, units = 'in', res = 300)#start graphics device
+  netVisual_aggregate(cellchat_e90_noBB, signaling = pathways.show[n_loop],  vertex.receiver = vertex.receiver,
+                      show.legend = FALSE, thresh = 0.05, color.use = umap_cols,
+                      arrow.size = 1, arrow.width = 1.5,)#want to view one pathway at a time
+  dev.off()
+  
+  n_loop <- n_loop + 1#iterate to next pathway
+}
+
+setwd('~/Sean/RNotebooks')
+```
+
+#View circle plots of ligand receptor (LR) pairs
+Vignette does not do this automated so I wrote a nested loop to print circle plots for each ligand receptor pair within each pathway
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Sean/Plots/E90_EpiDer_Refined/Ordered_noBB/LR_Pair_CirclePlot/'
+setwd(path_out)#need to change working directory to export plots b/c the plot is not a ggplot object
+
+n_pathway <- 1#storage variable to iterate through pathways
+while (n_pathway <= length(pathways.show)) {
+  LR.temp <- extractEnrichedLR(cellchat_e90_noBB, signaling = pathways.show[n_pathway], 
+                               geneLR.return = FALSE, thresh = 0.05,                      
+                               enriched.only = TRUE)#return sig. LR pairs from a single pathway
+  
+  n_lr <- 1#storage variable to iterate through ligand receptor pairs within a pathway
+  while (n_lr <= nrow(LR.temp)) {
+    print(paste(pathways.show[n_pathway], LR.temp[n_lr, ], sep = ': '))
+    vertex.receiver = seq(1, (nrow(LR.temp) + 1)) # a numeric vector
+    p1 <- netVisual_individual(cellchat_e90_noBB, signaling = pathways.show[n_pathway],  
+                         pairLR.use = LR.temp[n_lr, ], vertex.receiver = vertex.receiver,
+                         arrow.size = 1, arrow.width = 1.5, color.use = umap_cols)
+    
+      #use png graphics device to export the cellchat plots (gives control over dimensions and naming versus netVisual function)
+    png(filename = paste0(pathways.show[n_pathway], '-', LR.temp[n_lr, ], '.png', sep = ''),
+        width = 7, height = 7, units = 'in', res = 300)#start graphics device
+    netVisual_individual(cellchat_e90_noBB, signaling = pathways.show[n_pathway],  
+                         pairLR.use = LR.temp[n_lr, ], vertex.receiver = vertex.receiver,
+                         arrow.size = 1, arrow.width = 1.5, color.use = umap_cols)
+    dev.off()
+    
+    n_lr <- n_lr + 1#iterate to next ligand receptor pair within the pathway
+  }
+  
+  n_pathway <- n_pathway + 1#iterate to next pathway
+}
+
+setwd('~/Sean/RNotebooks')
+```
+
+##Compute and visualize the network centrality scores
+```{r}
+ptm = Sys.time()
+# Compute the network centrality scores
+cellchat_e90_noBB <- netAnalysis_computeCentrality(cellchat_e90_noBB, slot.name = "netP") # the slot 'netP' means the inferred intercellular communication network of signaling pathways
+# Visualize the computed centrality scores using heatmap, allowing ready identification of major signaling roles of cell groups
+netAnalysis_signalingRole_network(cellchat_e90_noBB, signaling = pathways.show, width = 8, height = 2.5, font.size = 10, color.use = umap_cols)
+```
+
+##Visualize dominant senders and receivers (Scatter Plot)
+```{r}
+# Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+gg1 <- netAnalysis_signalingRole_scatter(cellchat_e90_noBB, color.use = umap_cols)
+#> Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+# Signaling role analysis on the cell-cell communication networks of interest
+gg2 <- netAnalysis_signalingRole_scatter(cellchat_e90_noBB, signaling = c("PDGF", "ANGPTL"), color.use = umap_cols)
+#> Signaling role analysis on the cell-cell communication network from user's input
+gg1 + gg2
+```
+
+##Visualize dominant senders and receivers (Heatmap)
+```{r fig.height=15, fig.width=12}
+# Signaling role analysis on the aggregated cell-cell communication network from all signaling pathways
+ht1 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, pattern = "outgoing", color.use = umap_cols, width = 12, height = 15, font.size = 5)
+ht2 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, pattern = "incoming", color.use = umap_cols, width = 12, height = 15, font.size = 5)
+ht1 + ht2
+p1 <- ht1 + ht2
+
+```
+
+##Visualize dominant pathway senders and receivers (Heatmap)
+```{r fig.height=7, fig.width=12}
+path_out <- '~/Sean/Plots/E90_EpiDer_Refined/Ordered_noBB/Net_Heatmap/'
+setwd(path_out)#need to change working directory to export plots b/c the plot is not a ggplot object
+
+
+# Signaling role analysis on the cell-cell communication networks of interest
+POI <- c("BMP", "NRG", "PECAM1", "NOTCH", "TGFb", "EPHA", "WNT", "EPHB", "ANGPT", "ANGPTL", "VEGF", "CALCR", "CDH5", "PDGF", "FGF", "ncWNT", "EGF", "IL6", "CCL", "KIT", "EDN", "CXCL", "HGF", "OCLN", "RA")
+ht1 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, signaling = POI, pattern = "outgoing", color.use = umap_cols,
+                                         width = 12, height = 7, font.size = 7)
+ht2 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, signaling = POI, pattern = "incoming", color.use = umap_cols,
+                                         width = 12, height = 7, font.size = 7)
+ht1 + ht2
+
+#manually ordered rows into modules by sender
+POI <- c("NRG", "PDGF", "BMP", "NOTCH", "KIT",   "GAS", "EPHB",  "WNT",  "EPHA",  "SEMA6",  "EGF",  "EDN",   "SEMA5", "ANGPTL", "VEGF", "TGFb", "ncWNT",  "NECTIN", "FGF", "ANGPT", "IL6", "GHRELIN", "PECAM1", "CDH5", "CXCL", "CCL", "RA")
+
+
+ht1 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, signaling = POI, pattern = "outgoing", color.use = umap_cols,
+                                         width = 12, height = 7, font.size = 7)
+ht2 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, signaling = POI, pattern = "incoming", color.use = umap_cols,
+                                         width = 12, height = 7, font.size = 7)
+ht1 + ht2
+
+#use png graphics device to export the cellchat plots (gives control over dimensions and naming versus netVisual function)
+png(filename = paste0('PigE90_notDermalPocket_noBB_SenderReceiver_Heatmap', '.png', sep = ''),
+        width = 12, height = 7, units = 'in', res = 300)#start graphics device
+ht1 + ht2
+dev.off()
+
+
+#figure version
+#manually ordered rows into modules by sender
+POI <- c("NRG", "PDGF", "BMP", "NOTCH", "KIT",  "WNT",  "SEMA6",  "EGF",  "EDN",   "SEMA5", "ANGPTL", "VEGF", "TGFb", "ncWNT",  "NECTIN", "FGF", "ANGPT", "IL6", "GHRELIN", "PECAM1", "CDH5", "CXCL", "CCL", "RA")
+
+
+ht1 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, signaling = POI, pattern = "outgoing", color.use = umap_cols,
+                                         width = 12, height = 7, font.size = 7)
+ht2 <- netAnalysis_signalingRole_heatmap(cellchat_e90_noBB, signaling = POI, pattern = "incoming", color.use = umap_cols,
+                                         width = 12, height = 7, font.size = 7)
+ht1 + ht2
+
+
+#use png graphics device to export the cellchat plots (gives control over dimensions and naming versus netVisual function)
+png(filename = paste0('PigE90_notDermalPocket_noBB_Figure_SenderReceiver_Heatmap', '.png', sep = ''),
+        width = 12, height = 7, units = 'in', res = 300)#start graphics device
+ht1 + ht2
+dev.off()
+
+setwd('~/Sean/RNotebooks')
+```
+

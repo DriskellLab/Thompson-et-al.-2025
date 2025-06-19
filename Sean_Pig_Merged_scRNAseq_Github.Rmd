@@ -1,0 +1,1233 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#Load packages
+```{r}
+library(dplyr)
+library(Seurat)
+library(tictoc)
+library(reticulate)
+library(limma)#from Biocmanager
+library(ggplot2)
+library(viridisLite)
+library(patchwork)
+library(harmony)
+library(SeuratWrappers)
+library(monocle3)#may need install.packages("sf"); had to BiocManager:install('batchelor')
+library(future)
+plan('multisession', workers = 5)#cores = 5
+options(future.globals.maxSize = 100000 * 1024^2)
+
+```
+
+#1. Fig 3: Create Merged Pig Basal Keratinocyte Object and Transfer Labels (E90, P3, P10, 6mo)
+Subsetting the basal and differentiating IFE from P10 and 6mo (so no SOX9+ P3/P10/6mo clusters)
+```{r}
+load("/media/sean/T2TB/Object/E90_pig_krtno_sub.RData")#E90 krtno subset
+load("/media/sean/T2TB/Object/P3_pig_krtno_sub1.RData")#P3 krtno subset
+load("/media/sean/T2TB/Object/P10_pig_krtno_sub.RData")#P10 krtno subset
+load("/media/sean/T2TB/Object/6mo_pig_krtno_sub_v2.RData")#6mo krtno subset
+```
+
+#Create merged Seurat object
+```{r}
+# Subset the analyzed Seurat object (normalized data)
+E90_krtno_sub$orig.cluster <- paste('E90', E90_krtno_sub$seurat_clusters, sep = '_')
+table(E90_krtno_sub$seurat_clusters); table(E90_krtno_sub$orig.cluster)
+E90_basal <- subset(E90_krtno_sub, idents = c('0', '3', '5'), invert = FALSE)#keep K15+, drop SOX9+, K10+ clusters
+E90_basal#view the subset
+
+P3_krtno_sub$orig.cluster <- paste('P3', P3_krtno_sub$seurat_clusters, sep = '_')
+table(P3_krtno_sub$seurat_clusters); table(P3_krtno_sub$orig.cluster)
+P3_basal <- subset(P3_krtno_sub, idents = c('1', '2', '3'), invert = FALSE)#keep K15+, drop SOX9+, and K10+ clusters
+P3_basal#view the subset
+
+P10_krtno_sub$orig.cluster <- paste('P10', P10_krtno_sub$seurat_clusters, sep = '_')
+table(P10_krtno_sub$seurat_clusters); table(P10_krtno_sub$orig.cluster)
+P10_basal <- subset(P10_krtno_sub, idents = c('3', '5', '7'), invert = FALSE)#keep K15+, drop SOX9+ and K10+ clusters
+P10_basal
+
+Mon6_krtno_sub$orig.cluster <- paste('Mon6', Mon6_krtno_sub$seurat_clusters, sep = '_')
+table(Mon6_krtno_sub$seurat_clusters); table(Mon6_krtno_sub$orig.cluster)
+Mon6_basal <- subset(Mon6_krtno_sub, idents = c('5 Basal Krtno', '6 Div Krtno'), invert = FALSE)#keep K15+, drop SOX9+ and K10+ clusters
+Mon6_basal
+
+PigMerged_basal <- merge(x = E90_basal, y = c(P3_basal, P10_basal, Mon6_basal), add.cell.ids = c('E90', 'P3', 'P10', '6mo'), project = 'BasalMerged')
+PigMerged_basal
+table(PigMerged_basal$orig.ident); table(PigMerged_basal$orig.cluster)
+
+remove(E90_krtno_sub); remove(P3_krtno_sub); remove(P10_krtno_sub); remove(Mon6_krtno_sub)#save memory
+remove(E90_basal); remove(P3_basal); remove(P10_basal); remove(Mon6_basal)#save memory
+```
+
+#renormalize merged data using SCTransform
+```{r}
+## We want to renormalize the data to bring out the heterogenetiy within the lineage
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+VlnPlot(PigMerged_basal, features = c('nCount_SCT', 'nFeature_SCT'), group.by = 'orig.ident')
+
+tic('Running SCTransform')
+PigMerged_basal <- SCTransform(PigMerged_basal, do.scale = TRUE)
+toc()
+
+VlnPlot(PigMerged_basal, features = c('nCount_SCT', 'nFeature_SCT'), group.by = 'orig.ident')
+
+#Dimensional Reduction and Elbow Plot
+PigMerged_basal <- RunPCA(PigMerged_basal, verbose = FALSE)
+ElbowPlot(PigMerged_basal, ndims = 50)
+
+
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+PigMerged_basal <- RunUMAP(PigMerged_basal, dims = 1:20, verbose = FALSE, 
+                           umap.method = "umap-learn", metric = "correlation",
+                           n.neighbors = 20L, spread = 0.75)#default is dims = 1:30; n.neighbors = 30L; min.dist = 0.3, spread = 1
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+PigMerged_basal <- FindNeighbors(PigMerged_basal, dims = 1:20, verbose = FALSE)
+PigMerged_basal <- FindClusters(PigMerged_basal, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(PigMerged_basal, label = TRUE, pt.size = 0.5, label.size = 6)#numbers on clusters
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.5, group.by = 'orig.ident')#by sample
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.5, group.by = 'orig.ident') + NoLegend()#by sample
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.5, group.by = 'orig.cluster')#by sample
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.5, group.by = 'orig.cluster') + NoLegend()#by sample
+```
+
+### View Gene Expression of Keratinocyte Heterogeneity Markers
+```{r fig.height=5, fig.width=7}
+## FeaturePlots: view single-cell gene expression across clusters
+DimPlot(PigMerged_basal, label = TRUE, pt.size = 1, label.size = 6.0)
+
+GOI <- c('nCount_SCT', 'EDAR', 'LEF1', 'KRT15', 'KRT14', 'ITGB1', 'ITGA6', 'SOX6', 'COL17A1', 'KRT5', 'ENSSSCG00000026302', 'SOX9',  'KRT10', 'KRT1', 'SBSN','CALML5', 'CNFN', 'AREG', 'KRT8', 'VIM', 'PDGFA', 'PDGFC', 'CXCL14', 'NRG1', 'OPCML', 'DLK2', 'DLL1', 'TGFBI','ADAMTS9', 'OPCML', 'SOCS3', 'LAMB3', 'CAV1', 'ASS1', 'VEGFA', 'ANGPTL4', 'BMP7')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = PigMerged_basal,
+                    features = GOI[n_plot],
+                    pt.size = 0.5,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+PigMerged_basal <- FindClusters(PigMerged_basal, verbose = FALSE, algorithm = 3, resolution = 0.2)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(PigMerged_basal, label = TRUE, pt.size = 0.5, label.size = 6)#numbers on clusters
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.25, group.by = 'orig.ident')#by sample
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.25, group.by = 'orig.ident') + NoLegend()#by sample
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.25, group.by = 'orig.cluster')#by sample
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.25, group.by = 'orig.cluster') + NoLegend()#by sample
+```
+
+## Label the clusters
+'0', '1', '2', '3', '4', '5'
+Overlapping: 1/5, 2/3
+```{r message=FALSE, warning=FALSE}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids.sub <- c('0', '1', '2', '2', '3', '1')
+names(new.cluster.ids.sub) <- levels(PigMerged_basal)
+PigMerged_basal <- RenameIdents(PigMerged_basal, new.cluster.ids.sub)
+DimPlot(PigMerged_basal, label = TRUE, pt.size = 0.5, label.size = 6)#numbers on clusters
+```
+
+#Investigate Cluster Composition
+```{r}
+#Cluster composition by age
+#build basic dataframe where each cell (by cluster and orig.ident metadata) has 1 count to build proportion table for easy plotting
+fig_count <- data.frame("age" = PigMerged_basal$orig.ident, "seurat_cluster" = as.vector(PigMerged_basal@active.ident), 
+                        "original_cluster" = PigMerged_basal$orig.cluster,
+                          "count" = rep(1, length(as.vector(PigMerged_basal$orig.ident))))
+
+ggplot(fig_count, aes(x = factor(seurat_cluster, levels = c('3', '0', '2', '1')), fill = factor(age, levels = c('E90', 'P3', 'P10', '6mo')))) +
+  geom_bar(position = 'fill', stat = 'count') +
+  scale_fill_manual(values = c('#4C92FE', '#00A99D', '#755BC6', '#9B7562')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Age Proportion in All Clusters")
+
+ggplot(fig_count, aes(x = count, fill = factor(age, levels = c('E90', 'P3', 'P10', '6mo')))) +
+  geom_bar(position = 'fill', stat = 'count') +
+  scale_fill_manual(values = c('#4C92FE', '#00A99D', '#755BC6', '#9B7562')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Age Proportion in All Clusters")
+
+
+#Cluster composition by original cluster identity
+ggplot(fig_count, aes(x = factor(seurat_cluster, levels = c('3', '0', '2', '1')), fill = original_cluster)) +
+  geom_bar(position = 'fill', stat = 'count') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Orig.Cluster Proportion in All Clusters")
+```
+
+##Visualize Overlapping Expression of 2 Genes in 1 FeaturePlot
+```{r fig.height=5, fig.width=15}
+GOI <- c('EDAR', 'LEF1', 'KRT15', 'KRT14', 'ITGB1', 'ITGA6',
+         'COL17A1', 'LAMC1', 'KRT15', 'SOX6', 'TOP2A', 'ENSSSCG00000026302',
+         'PDGFA', 'PDGFC', 'CXCL14', 'ANGPTL4',
+         'DLK2',  'DLL1', 'TGFBI', 'TGFB2',
+         'NRG1', 'OPCML', 'JAG1', 'DLL1', 'NRG1', 'DLK2',
+         'BMP4', 'BMP7', 'VEGFA', 'ANGPTL4',
+         'OPCML', 'SOCS3', 'BMP7', 'BMP2', 'JAG1', 'DLL1'
+        )
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = PigMerged_basal,
+                    features = GOI[n_plot:(n_plot+1)],
+                    pt.size = 0.1,
+                    order = TRUE,
+                    blend = TRUE,
+                    max.cutoff = 'q90') + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 2
+}
+toc()
+```
+
+Save the Seurat object
+```{r}
+save(PigMerged_basal, file = '/media/sean/T2TB/Object/Pig_E90P3P106mo_Merged_Basal.RData')
+```
+
+## Recolor the UMAP clusters for Figure
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Sean/UMAP/'
+p1 <- DimPlot(PigMerged_basal, label = FALSE, pt.size = 2.0,
+              cols = c('#002783', '#225ea8', '#0c3695', '#00206A')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90_P3_P10_6mo Merged UMAP (Basal IFE).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(PigMerged_basal, label = FALSE, pt.size = 2.0,
+              cols = c('#1a9850', '#225ea8', '#0c3695', '#006d2c')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90_P3_P10_6mo Merged UMAP (Basal IFE, recolored).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.75, group.by = 'orig.ident',
+              cols = c('#9B7562', '#4C92FE', '#755BC6', '#00A99D')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90_P3_P10_6mo Merged UMAP (Basal IFE, by orig.ident).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.75, group.by = 'orig.cluster') + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90_P3_P10_6mo Merged UMAP (Basal IFE, by orig.cluster).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+DimPlot(PigMerged_basal, label = FALSE, pt.size = 0.25, group.by = 'orig.cluster')
+```
+
+
+
+#2. Create Postnatal Merged Pig Keratinocyte Object and Transfer Labels (to examine differentiation trajectory)
+Subsetting the basal and differentiating IFE only (remove SOX9+ and other clusters that relate to sweat glands and hair follicle components)
+```{r}
+# Subset the analyzed Seurat object (normalized data)
+P3_krtno_sub$orig.cluster <- factor(paste('P3', P3_krtno_sub$seurat_clusters, sep = '_'))
+table(P3_krtno_sub$seurat_clusters); table(P3_krtno_sub$orig.cluster)
+P3_diff <- subset(P3_krtno_sub, idents = c('4', '5', '6', '7'), invert = TRUE)#drop SOX9+ clusters
+P3_diff#view the subset
+
+P10_krtno_sub$orig.cluster <- factor(paste('P10', P10_krtno_sub$seurat_clusters, sep = '_'))
+table(P10_krtno_sub$seurat_clusters); table(P10_krtno_sub$orig.cluster)
+P10_diff <- subset(P10_krtno_sub, idents = c('2', '4'), invert = TRUE)#drop SOX9+ clusters
+P10_diff
+
+Mon6_krtno_sub$orig.cluster <- factor(paste('Mon6', Mon6_krtno_sub$seurat_clusters, sep = '_'))
+table(Mon6_krtno_sub$seurat_clusters); table(Mon6_krtno_sub$orig.cluster)
+Mon6_diff <- subset(Mon6_krtno_sub, idents = c('0 Diff Krtno', '8 AREG Krtno', '9 SOX9 Krtno'), invert = TRUE)#drop SOX9+ clusters
+Mon6_diff
+
+PigMerged_diff <- merge(x = P3_diff, y = c(P10_diff, Mon6_diff), add.cell.ids = c('P3', 'P10', '6mo'), project = 'PigMerged')
+PigMerged_diff
+table(PigMerged_diff$orig.ident); table(PigMerged_diff$orig.cluster)
+PigMerged_diff$orig.ident <- factor(PigMerged_diff$orig.ident)
+table(PigMerged_diff$orig.ident)
+```
+
+#renormalize merged data using SCTransform
+```{r}
+## We want to renormalize the data to bring out the heterogenetiy within the lineage
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+VlnPlot(PigMerged_diff, features = c('nCount_SCT', 'nFeature_SCT'), group.by = 'orig.ident')
+
+tic('Running SCTransform')
+PigMerged_diff <- SCTransform(PigMerged_diff, do.scale = TRUE)
+toc()
+
+VlnPlot(PigMerged_diff, features = c('nCount_SCT', 'nFeature_SCT'), group.by = 'orig.ident')
+
+#Dimensional Reduction and Elbow Plot
+PigMerged_diff <- RunPCA(PigMerged_diff, verbose = FALSE)
+ElbowPlot(PigMerged_diff, ndims = 50)
+
+
+```
+
+#batch correct SCTransformed data using Harmony
+```{r}
+tic('Running Harmony on SCT assay')
+#PigMerged_diff <- IntegrateLayers(object = PigMerged_diff, method = HarmonyIntegration,
+#  orig.reduction = "pca", new.reduction = 'harmony',
+#  assay = "SCT", verbose = FALSE)
+PigMerged_diff <- RunHarmony(PigMerged_diff, c("orig.ident"),
+                              plot_convergence = TRUE, nclust = 50, max_iter = 10, early_stop = T)#specify batch covariate
+toc()
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+PigMerged_diff <- RunUMAP(PigMerged_diff, dims = 1:20, verbose = FALSE, reduction = 'harmony',
+                           umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+PigMerged_diff <- FindNeighbors(PigMerged_diff, dims = 1:20, verbose = FALSE)
+PigMerged_diff <- FindClusters(PigMerged_diff, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(PigMerged_diff, label = TRUE, pt.size = 0.25, label.size = 6)#numbers on clusters
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25) + NoLegend()#no labels (to label in photoshop)
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.ident')#by sample
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.ident') + NoLegend()#by sample
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.cluster')#by sample
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.cluster') + NoLegend()#by sample
+```
+
+### View Gene Expression of Keratinocyte Heterogeneity Markers
+```{r fig.height=5, fig.width=7}
+## FeaturePlots: view single-cell gene expression across clusters
+DimPlot(PigMerged_diff, label = TRUE, pt.size = 1, label.size = 6.0)
+
+GOI <- c('EDAR', 'LEF1', 'KRT15', 'KRT14', 'ITGB1', 'ITGA6', 'SOX6', 'COL17A1', 'KRT5', 'ENSSSCG00000026302', 'SOX9',  'KRT10', 'KRT1', 'SBSN','CALML5', 'CNFN', 'AREG', 'KRT8', 'VIM', 'PDGFA', 'PDGFC', 'CXCL14', 'NRG1', 'DLK2', 'TGFBI', 'DLL1', 'ADAMTS9', 'OPCML', 'SOCS3', 'nCount_SCT')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = PigMerged_diff,
+                    features = GOI[n_plot],
+                    pt.size = 0.25,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+PigMerged_diff <- FindClusters(PigMerged_diff, verbose = FALSE, algorithm = 3, resolution = 0.1)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(PigMerged_diff, label = TRUE, pt.size = 0.25, label.size = 6)#numbers on clusters
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25) + NoLegend()#no labels (to label in photoshop)
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.ident')#by sample
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.ident') + NoLegend()#by sample
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.cluster')#by sample
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 0.25, group.by = 'orig.cluster') + NoLegend()#by sample
+```
+
+##Visualize Overlapping Expression of 2 Genes in 1 FeaturePlot
+```{r fig.height=5, fig.width=15}
+GOI <- c('EDAR', 'LEF1', 'KRT14', 'KRT15', 'ITGA6', 'ITGB1',
+         'COL17A1', 'LAMC1', 'COL17A1', 'SOX6', 'KRT15', 'SOX6', 'TOP2A', 'ENSSSCG00000026302',
+         'PDGFC', 'PDGFA', 'CXCL14', 'ANGPTL4',
+         'DLK2',  'DLL1', 'TGFBI', 'TGFB2',
+         'NRG1', 'OPCML', 'JAG1', 'DLL1', 'NRG1', 'DLK2',
+         'BMP4', 'BMP7', 'VEGFA', 'ANGPTL4',
+         'SOCS3', 'OPCML', 'KRT15', 'KRT10', 'CALML5', 'IVL', 'LAMB3', 'LAMC1', 'KRT15', 'PDGFC', 'BMP7', 'SMAD1', 'SMAD5', 'SMAD1', 'BMP7', 'TGFB2',
+         'CAV1', 'ASS1', 'BMP7', 'KRT15', 'BMP7', 'BMP2', 'BMP4', 'BMP2', 'OPCML', 'TGFB2', 'PHLDB2', 'OPCML'
+        )
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = PigMerged_diff,
+                    features = GOI[n_plot:(n_plot+1)],
+                    pt.size = 0.1,
+                    order = TRUE,
+                    blend = TRUE,
+                    max.cutoff = 'q90')#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 2
+}
+toc()
+```
+
+#Cleanup the clustering
+```{r}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids.sub <- c('0', '1', '0')
+names(new.cluster.ids.sub) <- levels(PigMerged_diff)
+PigMerged_diff <- RenameIdents(PigMerged_diff, new.cluster.ids.sub)
+DimPlot(PigMerged_diff, label = TRUE, pt.size = 0.5, label.size = 6)#numbers on clusters
+FeaturePlot(PigMerged_diff, features = 'ENSSSCG00000026302')
+
+#0. Diff
+select.cells <- choose_cells(cds_pigmerge_ife, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_diff, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_diff, cells = select.cells) <- "0"#K10+ far from cluster 1
+
+#2. Dividing
+select.cells <- choose_cells(cds_pigmerge_ife, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_diff, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_diff, cells = select.cells) <- "2"#MKI67+
+```
+
+```{r}
+DimPlot(PigMerged_diff, label = TRUE, pt.size = 1.0)
+PigMerged_diff@active.ident <- factor(PigMerged_diff@active.ident, levels = c('0', '1', '2'))
+PigMerged_diff$seurat_clusters <- PigMerged_diff@active.ident
+DimPlot(PigMerged_diff, label = TRUE, pt.size = 1.0)
+DimPlot(PigMerged_diff, label = TRUE, pt.size = 1.0, group.by = 'seurat_clusters')
+```
+
+Save the Seurat object
+```{r}
+save(PigMerged_diff, file = '/media/sean/T2TB/Object/Pig_P3P106mo_Merged_IFE_v2.RData')
+```
+
+#Investigate Cluster Composition
+```{r}
+#Cluster composition by age
+#build basic dataframe where each cell (by cluster and orig.ident metadata) has 1 count to build proportion table for easy plotting
+fig_count <- data.frame("age" = PigMerged_diff$orig.ident, "seurat_cluster" = factor(as.vector(PigMerged_diff@active.ident)), 
+                        "original_cluster" = PigMerged_diff$orig.cluster,
+                          "count" = rep(1, length(as.vector(PigMerged_diff$orig.ident))))
+
+ggplot(fig_count, aes(x = factor(seurat_cluster, levels = c('1', '2', '0')), fill = factor(age, levels = c('P3', 'P10', '6mo')))) +
+  geom_bar(position = 'fill', stat = 'count') +
+  scale_fill_manual(values = c('#00a99d', '#755BC6', '#9B7562')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Age Proportion in All Clusters")
+
+ggplot(fig_count, aes(x = count, fill = factor(age, levels = c('P3', 'P10', '6mo')))) +
+  geom_bar(position = 'fill', stat = 'count') +
+  scale_fill_manual(values = c('#00a99d', '#755BC6', '#9B7562')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Overall Proportion in All Clusters")
+
+
+ggplot(fig_count, aes(x = factor(age, levels = c('P3', 'P10', '6mo')), fill = factor(seurat_cluster, levels = c('0', '2', '1')))) +
+  geom_bar(position = 'fill', stat = 'count') +
+  scale_fill_manual(values = c('#f0b627', '#225ea8', '#0c3695')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("State Proportion by Age")
+
+
+#Cluster composition by original cluster identity
+ggplot(fig_count, aes(x = seurat_cluster, fill = original_cluster)) +
+  geom_bar(position = 'fill', stat = 'count') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Orig.Cluster Proportion in All Clusters")
+```
+
+## Recolor the UMAP clusters by cell lineage
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Sean/UMAP/'
+p1 <- DimPlot(PigMerged_diff, label = FALSE, pt.size = 1.0, 
+              cols = c('#f0b627', '#0c3695', '#225ea8')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig P3_P10_6mo Merged UMAP (IFE) V2.png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(PigMerged_diff, label = FALSE, pt.size = 1, group.by = 'orig.ident',
+              cols = c('#9B7562', '#755BC6', '#00a99d'), order = c('P3')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig P3_P10_6mo Merged UMAP (IFE, by orig.ident) V2.png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(PigMerged_diff, label = FALSE, pt.size = 1, group.by = 'orig.cluster') + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig P3_P10_6mo Merged UMAP (IFE, by orig.cluster) V2.png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+DimPlot(PigMerged_diff, label = FALSE, pt.size = 1, group.by = 'orig.ident',
+              cols = c('#9B7562', '#755BC6', '#00a99d'), order = c('P3'))
+```
+
+#B. Basal-Differentiating Trajectory: Convert Seurat to CDS and Do Pseudotime in Monocle3
+```{r}
+#want to transfer Seurat UMAP coordinates to CDS object so pseudotime is on the Seurat clusters
+temp1 <- PigMerged_diff@reductions$umap@cell.embeddings#large matrix with rows cell barcodes and 2 columns for the Seurat x/y UMAP coordinates
+temp2 <- PigMerged_diff@meta.data$SCT_snn_res.0.1#factor levels for the cluster ids at the resolution used to cluster the Seurat object
+
+cds_pigmerge_ife <- as.cell_data_set(PigMerged_diff, group.by = 'seurat_clusters')#function from SeuratWrappers to convert to Monocle3 object, graph argument specifies the clustering to transfer (assay to use, and active resolution) to @clusters
+#cds_pigmerge_ife <- cluster_cells(cds_pigmerge_ife, reduction_method = "UMAP", group_cells_by = 'seurat_clusters')#
+
+#Add some info not carried over by SeuratWrappers
+cds_pigmerge_ife <- estimate_size_factors(cds_pigmerge_ife)#add size factor metadata to CDS object
+cds_pigmerge_ife@rowRanges@elementMetadata@listData[["gene_short_name"]] <- rownames(PigMerged_diff)#correct gene names in CDS object
+
+#Validate UMAP coordinate transfer from Seurat object -> CDS object
+temp1 <- PigMerged_diff@reductions$umap@cell.embeddings#large matrix with rows cell barcodes and 2 columns for the Seurat x/y UMAP coordinates
+temp2 <- cds_pigmerge_ife@int_colData@listData$reducedDims$UMAP#matrix with rows cell barcodes and 2 columns for x/y UMAP coordinates
+table(temp1 == temp2)#if all TRUE, seuratwrapper successfully transferred umap coordinates to CDS object via the graph argument
+#cds_pigmerge_ife@int_colData@listData$reducedDims$UMAP <- PigMerged_diff@reductions$umap@cell.embeddings#not needed due to graph argument when making CDS object
+
+#need to transfer Seurat PCA since this wasn't transferred by seurat wrapper
+reducedDim(cds_pigmerge_ife, type = "PCA") <- PigMerged_diff@reductions$pca@cell.embeddings#transfer the matrix results of Seurat PCA to CDS
+#cds_pigmerge_ife@preprocess_aux$prop_var_expl <- PigMerged_diff@reductions$pca@stdev#transfer numerical vector containing stdev values per PCA dimension
+
+#partitions still need to be created for learn_graph()
+#manual_partition <- PigMerged_diff@meta.data$seurat_clusters#get numerical vector of cluster id #s to construct manual partition
+#krt_id <- c('0', '1', '2', '3', '6', '8', '9', '12')#keratinocytes
+#misc_id <- c('4', '5', '7', '10', '11')#non-keratinocytes
+#krt_i <- grep(pattern = krt_id, x = manual_partition)#find index position of matching cluster ids
+#misc_i <- grep(pattern = misc_id, x = manual_partition)#find index position of matching cluster ids
+#manual_partion[krt_i] <- '1'#set all krtno cluster ids to manual partition id '1'
+#manual_partition[misc_i] <- '2'#set non-krtno cluster ids to manual partition id '2'
+#table(levels(manual_partition))#validate replacement
+
+manual_partition <- PigMerged_diff@active.ident#get cluster id #s to construct manual partition from a factor
+cds_pigmerge_ife@clusters@listData[["UMAP"]][["clusters"]] <- manual_partition#transfer active.ident to cds object
+cds_pigmerge_ife@colData@listData[["seurat_clusters"]] <- manual_partition#transfer active.ident to cds object
+names(manual_partition) <- rownames(PigMerged_diff@meta.data)#
+manual_partition <- as.factor(manual_partition)
+head(manual_partition)#view ordered levels
+levels(manual_partition) <- c(1, 1, 2)#as.factor ordered levels such that 0, 1, 10, 11, 2, ... so 8 is i=11
+table(levels(manual_partition))#validate replacement
+cds_pigmerge_ife@clusters@listData$UMAP$partitions <- manual_partition
+
+
+#recreate.partition <- c(rep(1, length(cds_pigmerge_ife@colData@rownames)))
+#names(recreate.partition) <- cds_pigmerge_ife@colData@rownames#assigns partition value to cell barcode
+#recreate.partition <- as.factor(recreate.partition)#converts this to a large factor with 1 level
+#cds_pigmerge_ife@clusters@listData$UMAP$partitions <- recreate.partition
+
+p1 <- plot_cells(cds_pigmerge_ife, reduction_method = 'UMAP',
+                 color_cells_by = 'seurat_clusters', 
+                 label_cell_groups = FALSE,
+                 cell_size = 1,
+                 show_trajectory_graph = FALSE)#is a ggplot2 object, so can custom color same as with Seurat's DimPlot
+p1
+plot_cells(cds_pigmerge_ife, reduction_method = 'UMAP',
+                 color_cells_by = 'cluster', 
+                 label_cell_groups = FALSE,
+                 cell_size = 1,
+                 show_trajectory_graph = FALSE)#Monocle3 clusters, transferred from Seurat
+plot_cells(cds_pigmerge_ife, reduction_method = 'UMAP',
+                 color_cells_by = 'partition', 
+                 label_cell_groups = TRUE,
+                 cell_size = 1,
+                 show_trajectory_graph = FALSE)
+#pseudotime
+
+#rownames(cds_pigmerge_ife@principal_graph_aux$UMAP$dp_mst) <- NULL
+#colnames(cds_pigmerge_ife@int_colData@listData$reducedDims$UMAP) <- NULL
+
+cds_pigmerge_ife <- learn_graph(cds_pigmerge_ife, use_partition = TRUE, verbose = TRUE, close_loop = TRUE)
+p2 <- plot_cells(cds_pigmerge_ife, reduction_method = 'UMAP',
+                 color_cells_by = 'seurat_clusters', 
+                 label_cell_groups = FALSE, cell_size = 1,
+                 show_trajectory_graph = TRUE)#is a ggplot2 object, so can custom color same as with Seurat's DimPlot
+p2
+
+plot_cells(cds_pigmerge_ife, reduction_method = 'UMAP',
+                 color_cells_by = 'seurat_clusters', 
+                 group_label_size = 5, cell_size = 1,
+                 show_trajectory_graph = TRUE,
+                 label_leaves=TRUE,
+                 label_branch_points=TRUE,
+                 label_roots = TRUE)#is a ggplot2 object, so can custom color same as with Seurat's DimPlot
+
+
+cds_pigmerge_ife <- order_cells(cds_pigmerge_ife)#choose root node
+plot_cells(cds_pigmerge_ife,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           label_roots = FALSE,
+           cell_size = 0.75,
+           trajectory_graph_color = "grey60")
+plot_cells(cds_pigmerge_ife,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           label_roots = FALSE,
+           cell_size = .75,
+           show_trajectory_graph = FALSE)
+
+
+```
+
+#Figure pseudotime plots
+```{r fig.height=5, fig.width=6}
+#cds_pigmerge_ife_sub <- choose_cells(cds_pigmerge_ife)#no need
+plot_cells(cds_pigmerge_ife,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           label_roots = TRUE,
+           graph_label_size = 3,
+           cell_size = 0.75,
+           trajectory_graph_color = "grey70")
+plot_cells(cds_pigmerge_ife,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=FALSE,
+           label_branch_points=FALSE,
+           label_roots = TRUE,
+           cell_size = .75,
+           show_trajectory_graph = FALSE)
+plot_cells(cds_pigmerge_ife,
+           color_cells_by = "pseudotime",
+           group_cells_by = "cluster",
+           label_cell_groups = FALSE,
+           label_groups_by_cluster=FALSE,
+           label_leaves=TRUE,
+           label_branch_points=TRUE,
+           label_roots = TRUE,
+           cell_size = .75,
+           show_trajectory_graph = TRUE)
+```
+
+Save CDS object
+```{r}
+save(cds_pigmerge_ife, file = '/media/sean/T2TB/Object/pigmerged_p3p10mon6_IFE_basaltodiff_CDS.RData')
+```
+
+#View Expression Trajectories Across Keratinocyte Clusters (w/ GAM)
+```{r}
+pseudotime_df <- as.data.frame(t(cds_pigmerge_ife@assays@data@listData$logcounts))#get cell by gene expression matrix
+pseudotime_df$Barcode <- rownames(pseudotime_df)#get column of barcode values
+pseudotime_df$Pseudotime <- pseudotime(cds_pigmerge_ife)#get pseudotime values
+
+temp_df <- data.frame("Barcode" = rownames(as.data.frame(cds_pigmerge_ife@clusters@listData$UMAP$clusters)), 
+                      "Cluster" = cds_pigmerge_ife@clusters@listData$UMAP$clusters)#get cluster ids
+
+pseudotime_df <- merge(temp_df, pseudotime_df)#filter to shared rows in subset cds
+pseudotime_df <- pseudotime_df[pseudotime_df$Pseudotime != Inf, ]#remove rows w/ inf pseudotime value
+#write.csv(pseudotime_df, file = '~/Desktop/Sean_CellChat/Pseudotime/6moPig_Krtno_Pseudotime.csv', row.names = FALSE)#save pseudotime data
+
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  stat_smooth(aes(y = ITGA6), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'grey60', se = FALSE, linetype = 'dashed') +
+  #stat_smooth(aes(y = SHH), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'blue', se = FALSE) +   
+  stat_smooth(aes(y = LEF1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'red', se = FALSE) +
+  stat_smooth(aes(y = EDAR), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime Basal Bud (Figure)")#SHH not detected in any of these datasets so errors if included
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  stat_smooth(aes(y = KRT15), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue4', se = FALSE) +
+  stat_smooth(aes(y = KRT14), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue3', se = FALSE) +  
+  stat_smooth(aes(y = KRT5), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue1', se = FALSE) +
+  stat_smooth(aes(y = KRT10), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkgoldenrod2', se = FALSE) +
+  stat_smooth(aes(y = KRT1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkorange', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime Keratins")
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  stat_smooth(aes(y = KRT15), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue4', se = FALSE) +
+  stat_smooth(aes(y = KRT14), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue3', se = FALSE) +  
+  stat_smooth(aes(y = KRT5), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue1', se = FALSE) +
+  stat_smooth(aes(y = KRT10), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkgoldenrod2', se = FALSE) +
+  stat_smooth(aes(y = KRT1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkorange', se = FALSE) +
+  stat_smooth(aes(y = CALML5), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = '#d04800', se = FALSE) +
+    stat_smooth(aes(y = IVL), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = '#963400', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime Differentiation")
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  #stat_smooth(aes(y = ITGA6), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'grey30', se = FALSE) +
+  #stat_smooth(aes(y = ITGA2), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'grey50', se = FALSE) +
+  #stat_smooth(aes(y = ITGB1), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'grey60', se = FALSE) +
+  #stat_smooth(aes(y = COL17A1), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'green3', se = FALSE) +
+  #stat_smooth(aes(y = LAMC1), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'green4', se = FALSE) +
+  stat_smooth(aes(y = KRT15), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue4', se = FALSE) +
+  #stat_smooth(aes(y = SOX6), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'peru', se = FALSE) +  
+  stat_smooth(aes(y = DLK2), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'red4', se = FALSE) +
+  stat_smooth(aes(y = DLL1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'red3', se = FALSE) +
+  stat_smooth(aes(y = NRG1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkgoldenrod2', se = FALSE) +
+  stat_smooth(aes(y = OPCML), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'orchid3', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime Core Basal State V1")
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  stat_smooth(aes(y = ITGA6), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue3', se = FALSE) +
+  #stat_smooth(aes(y = ITGA2), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'grey50', se = FALSE) +
+  stat_smooth(aes(y = ITGB1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue1', se = FALSE) +
+  stat_smooth(aes(y = COL17A1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green3', se = FALSE) +
+  stat_smooth(aes(y = PDGFC), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green4', se = FALSE) +
+  stat_smooth(aes(y = ANGPTL4), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'orchid4', se = FALSE) +
+  stat_smooth(aes(y = SOX6), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'peru', se = FALSE) +  
+  stat_smooth(aes(y = LAMB3), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'orchid3', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime General Basal State")
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  stat_smooth(aes(y = ITGA6), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue3', se = FALSE) +
+  #stat_smooth(aes(y = ITGA2), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'grey50', se = FALSE) +
+  stat_smooth(aes(y = ITGB1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue1', se = FALSE) +
+  stat_smooth(aes(y = COL17A1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green3', se = FALSE) +
+  stat_smooth(aes(y = PDGFC), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green4', se = FALSE) +
+  stat_smooth(aes(y = ANGPTL4), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkorchid', se = FALSE) +
+  stat_smooth(aes(y = SOX6), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'peru', se = FALSE) +  
+  stat_smooth(aes(y = LAMB3), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'blue3', se = FALSE) +
+    stat_smooth(aes(y = LAMC1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'blue4', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime General Basal State UPDATE")
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  stat_smooth(aes(y = ITGA6), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue3', se = FALSE) +
+  #stat_smooth(aes(y = ITGA2), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'steelblue4', se = FALSE) +
+  stat_smooth(aes(y = ITGB1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue1', se = FALSE) +
+  stat_smooth(aes(y = COL5A2), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green4', se = FALSE) +
+  stat_smooth(aes(y = COL17A1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green3', se = FALSE) +
+  stat_smooth(aes(y = SOX6), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'peru', se = FALSE) +  
+  stat_smooth(aes(y = LAMB3), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'blue3', se = FALSE) +
+  stat_smooth(aes(y = LAMC1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'blue4', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime Canonical Basal Marker Genes")
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+stat_smooth(aes(y = KRT15), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'steelblue4', se = FALSE) +
+  #stat_smooth(aes(y = SOX6), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'peru', se = FALSE) +  
+  stat_smooth(aes(y = DLK2), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'red4', se = FALSE) +
+  stat_smooth(aes(y = DLL1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'red3', se = FALSE) +
+  stat_smooth(aes(y = OPCML), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'orchid3', se = FALSE) +
+  stat_smooth(aes(y = PHLDB2), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'peru', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime Core Basal State UPDATE")
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  stat_smooth(aes(y = PDGFC), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'green4', se = FALSE) +
+  stat_smooth(aes(y = ANGPTL4), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkorchid', se = FALSE) +
+  stat_smooth(aes(y = VEGFA), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'orchid', se = FALSE) +  
+  stat_smooth(aes(y = DLL1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'blue3', se = FALSE) +
+    stat_smooth(aes(y = LAMC1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'blue4', se = FALSE) +
+  theme_classic() +
+  ggtitle("Pseudotime General Basal Signaling")
+
+
+ggplot(pseudotime_df, aes(x = Pseudotime)) +
+  #stat_smooth(aes(y = ITGA6), method = "gam", formula = y ~ s(x), 
+  #            size = 1, alpha = .75, color = 'grey40', se = FALSE) +
+  stat_smooth(aes(y = BMP2), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'royalblue1', se = FALSE) +
+  stat_smooth(aes(y = BMP4), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'royalblue3', se = FALSE) +
+  stat_smooth(aes(y = SMAD1), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'orchid3', se = FALSE) +
+  stat_smooth(aes(y = SMAD5), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'darkorchid', se = FALSE) +
+  stat_smooth(aes(y = BMPR1A), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'red4', se = FALSE) +  
+  stat_smooth(aes(y = BMPR2), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'red3', se = FALSE) +
+  stat_smooth(aes(y = BMP7), method = "gam", formula = y ~ s(x), 
+              size = 1, alpha = .75, color = 'royalblue4', se = FALSE) +
+  theme_classic() +
+  ggtitle("BMP-signaling")
+
+```
+
+
+#3. Create Merged Postnatal Pig Dermis Object and Transfer Labels (APCDD1+ Fibroblasts, Pericytes, Blood Vessels from E90, P3, P10, 6mo)
+```{r}
+load("/media/sean/T2TB/Object/6mo_pig_allclusters_v2.RData")
+load("/media/sean/T2TB/Object/p10_pig_allclusters_v3.RData")
+load("/media/sean/T2TB/Object/p3_pig_allclusters_v3.RData")
+load("/media/sean/T2TB/Object/e90_pig_allclusters_v3.RData")
+```
+
+#Create merged Seurat object
+```{r}
+e90$orig.cluster <- factor(paste('E90', e90$seurat_clusters, sep = '_'))
+table(e90$seurat_clusters); table(e90$orig.cluster)
+E90_derm <- subset(e90, idents = c('4 PF', '9 BV', '12 Pericyte', '23 LV'), invert = FALSE)
+E90_derm#view the subset
+
+temp <- as.data.frame(strsplit2(x = as.character(P3@active.ident), split = ' '))
+P3$orig.cluster <- factor(paste('P3', temp$V1, sep = '_'))
+table(P3$seurat_clusters); table(P3$orig.cluster)
+P3_derm <- subset(P3, idents = c('3 BV', '6 PF', '7 Pericyte', '12 Div BV', '15 LV'), invert = FALSE)
+P3_derm#view the subset
+
+D10$orig.cluster <- factor(paste('P10', D10$seurat_clusters, sep = '_'))
+table(D10$seurat_clusters); table(D10$orig.cluster)
+P10_derm <- subset(D10, idents = c('9 Pericyte', '10 BV', '11 PF', 
+                                            '15 ACTA2 Fibro', '17 LV'), invert = FALSE)
+P10_derm
+
+Mon6$orig.cluster <- factor(paste('Mon6', Mon6$seurat_clusters, sep = '_'))
+table(Mon6$seurat_clusters); table(Mon6$orig.cluster)
+Mon6_derm <- subset(Mon6, idents = c('0 Pericyte', '3 Fibroblast', '6 BV', '16 LV'), invert = FALSE)
+Mon6_derm
+```
+
+#Merge the subsets
+```{r}
+PigMerged_derm <- merge(x = E90_derm, y = c(P3_derm, P10_derm, Mon6_derm), add.cell.ids = c('E90', 'P3', 'P10', '6mo'), project = 'PigMerged')
+PigMerged_derm
+
+remove(E90_derm); remove(P3_derm); remove(P10_derm); remove(Mon6_derm)
+```
+
+#renormalize merged data using SCTransform
+```{r}
+## We want to renormalize the data to bring out the heterogenetiy within the lineage
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+VlnPlot(PigMerged_derm, features = c('nCount_SCT', 'nFeature_SCT'), group.by = 'orig.ident')
+
+tic('Running SCTransform')
+PigMerged_derm <- SCTransform(PigMerged_derm, do.scale = TRUE)
+#PigMerged_derm <- PrepSCTFindMarkers(PigMerged_derm)
+toc()
+
+VlnPlot(PigMerged_derm, features = c('nCount_SCT', 'nFeature_SCT'), group.by = 'orig.ident')
+
+#Dimensional Reduction and Elbow Plot
+PigMerged_derm <- RunPCA(PigMerged_derm, verbose = FALSE)
+ElbowPlot(PigMerged_derm, ndims = 50)
+
+
+```
+
+#batch correct SCTransformed data using Harmony
+```{r}
+tic('Running Harmony on SCT assay')
+PigMerged_derm <- RunHarmony(PigMerged_derm, c("orig.ident"),
+                              plot_convergence = TRUE, nclust = 50, max_iter = 10, early_stop = T)#specify batch covariate
+toc()
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+PigMerged_derm <- RunUMAP(PigMerged_derm, dims = 1:20, verbose = FALSE, reduction = 'harmony',
+                           umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+PigMerged_derm <- FindNeighbors(PigMerged_derm, dims = 1:20, verbose = FALSE)
+PigMerged_derm <- FindClusters(PigMerged_derm, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(PigMerged_derm, label = TRUE, pt.size = 0.5, label.size = 6)#numbers on clusters
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.ident')#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.ident') + NoLegend()#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.cluster')#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.cluster') + NoLegend()#by sample
+```
+
+### View Gene Expression of Cell Lineage Markers
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+## FeaturePlots: view single-cell gene expression across clusters
+DimPlot(PigMerged_derm, label = TRUE, pt.size = 1, label.size = 6.0)
+
+GOI <- c('PDGFRA', 'LEF1', 'APCDD1', 'ALX4', 'DPP4', 'ACTA2', 'CTHRC1', 'MFAP5', 'PPARG', 'COL11A1', 'CRABP1', 'PDGFRB', 'RGS5', 'IGFBP7', 'PECAM1',  'CDH5', 'LYVE1', 'FLT4', 'CCL21', 'ANGPT1', 'ANGPT2', 'ANGPTL1', 'ANGPTL2', 'ANGPTL4', 'VEGFA', 'VEGFC', 'VEGFD', 'PDGFA', 'PDGFB', 'PDGFC', 'TOP2A', 'IL6', 'SEMA3C', 'nCount_SCT')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = PigMerged_derm,
+                    features = GOI[n_plot],
+                    pt.size = 0.1,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+PigMerged_derm <- FindClusters(PigMerged_derm, verbose = FALSE, algorithm = 3, resolution = 0.5)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(PigMerged_derm, label = TRUE, pt.size = 0.5, label.size = 6)#numbers on clusters
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.1) + NoLegend()#no labels (to label in photoshop)
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.1, group.by = 'orig.ident', order = c('P10'))#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.1, group.by = 'orig.ident', order = c('P10')) + NoLegend()#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.1, group.by = 'orig.cluster')#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.1, group.by = 'orig.cluster') + NoLegend()#by sample
+```
+
+#Select manual clusters based on FeaturePlots DEGs
+Algorithmic clustering missed some population distinctions that are clear based on marker genes, correcting those below
+```{r}
+cds_derm <- as.cell_data_set(PigMerged_derm, group.by = 'SCT_snn_res.0.5')#function from SeuratWrappers to convert to Monocle3 object, graph argument specifies the clustering to transfer (assay to use, and active resolution) to @clusters
+#cds_derm <- cluster_cells(cds_derm, reduction_method = "UMAP", group_cells_by = 'seurat_clusters')#
+
+#Add some info not carried over by SeuratWrappers
+cds_derm <- estimate_size_factors(cds_derm)#add size factor metadata to CDS object
+cds_derm@rowRanges@elementMetadata@listData[["gene_short_name"]] <- rownames(PigMerged_derm)#correct gene names in CDS object
+
+#Validate UMAP coordinate transfer from Seurat object -> CDS object
+temp1 <- PigMerged_derm@reductions$umap@cell.embeddings#large matrix with rows cell barcodes and 2 columns for the Seurat x/y UMAP coordinates
+temp2 <- cds_derm@int_colData@listData$reducedDims$UMAP#matrix with rows cell barcodes and 2 columns for x/y UMAP coordinates
+table(temp1 == temp2)#if all TRUE, seuratwrapper successfully transferred umap coordinates to CDS object via the graph argument
+#cds_derm@int_colData@listData$reducedDims$UMAP <- PigMerged_derm@reductions$umap@cell.embeddings#not needed due to graph argument when making CDS object
+
+#need to transfer Seurat PCA since this wasn't transferred by seurat wrapper
+reducedDim(cds_derm, type = "PCA") <- PigMerged_derm@reductions$pca@cell.embeddings#transfer the matrix results of Seurat PCA to CDS
+#cds_derm@preprocess_aux$prop_var_expl <- PigMerged_derm@reductions$pca@stdev#transfer numerical vector containing stdev values per PCA dimension
+
+
+#1. Fibroblasts
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "1. Fibro"#PDGFRA+
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "2. PECAM1 Fibro"#PDGFRA+/PECAM1+
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "3. Div Fibro"#PDGFRA+/TOP2A+
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "4. ALX4 Fibro"#PDGFRA+/CTHRC1+
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "5. CTHRC1 Fibro"#PDGFRA+/CTHRC1+
+
+#2. Pericytes
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "6. Peri"#RGS5+/ACTA2+
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "7. IL6 Peri"#RGS5+/ANGPTL2+/IL6+
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "8. Peri2"#ACTA2+/IGFBP7+/signaling low
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "9. Div Peri"#RGS5+/TOP2A+
+
+
+#3. BV
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "10. BV"#CDH5+/PECAM1+
+
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "11. Div BV"#CDH5+/PECAM1+/TOP2A+
+
+#4. LV
+select.cells <- choose_cells(cds_derm, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(PigMerged_derm, cells = as.vector(select.cells))
+plot
+Idents(PigMerged_derm, cells = select.cells) <- "12. LV"#CDH5+/LYVE1+/FLT4+/CCL21+
+```
+
+#View Refined Clusters
+```{r}
+DimPlot(PigMerged_derm, label = TRUE, pt.size = 0.5, label.size = 6)#numbers on clusters
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.ident')#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.ident') + NoLegend()#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.cluster')#by sample
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5, group.by = 'orig.cluster') + NoLegend()#by sample
+DimPlot(PigMerged_derm, label = TRUE, pt.size = 0.5, label.size = 6, split.by = 'ident')#numbers on clusters
+```
+
+Save the Seurat object
+```{r}
+PigMerged_derm@active.ident <- factor(PigMerged_derm@active.ident, levels = c('1. Fibro', '2. PECAM1 Fibro', '3. Div Fibro', '4. ALX4 Fibro', 
+                                                                              '5. CTHRC1 Fibro', '6. Peri', '7. IL6 Peri', '8. Peri2', 
+                                                                              '9. Div Peri', '10. BV', '11. Div BV', '12. LV'))
+PigMerged_derm$seurat_clusters <- PigMerged_derm@active.ident
+save(PigMerged_derm, file = '/media/sean/T2TB/Object/PigMerged_E90P3P106mo_PFDermis_updated.RData')
+```
+
+#Investigate Cluster Composition
+```{r}
+#Cluster composition by age
+#build basic dataframe where each cell (by cluster and orig.ident metadata) has 1 count to build proportion table for easy plotting
+fig_count <- data.frame("age" = PigMerged_derm$orig.ident, "seurat_cluster" = factor(as.vector(PigMerged_derm@active.ident)), 
+                        "original_cluster" = PigMerged_derm$orig.cluster,
+                          "count" = rep(1, length(as.vector(PigMerged_derm$orig.ident))))
+
+ggplot(fig_count, aes(x = factor(seurat_cluster, levels = levels(PigMerged_derm)), fill = factor(age, levels = c('E90', 'P3', 'P10', '6mo')))) +
+  geom_bar(position = 'fill', stat = 'count') +
+  scale_fill_manual(values = c('#4C92FE', '#00A99D', '#755BC6', '#9B7562')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Age Proportion in All Clusters")
+
+#Cluster composition by original cluster identity
+ggplot(fig_count, aes(x = factor(seurat_cluster, levels = levels(PigMerged_derm)), fill = original_cluster)) +
+  geom_bar(position = 'fill', stat = 'count') +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Orig.Cluster Proportion in All Clusters")
+
+#Cluster composition by original cluster identity
+ggplot(fig_count, aes(x = count, fill = factor(age, levels = c('E90', 'P3', 'P10', '6mo')))) +
+  geom_bar(position = 'fill', stat = 'count') +
+  scale_fill_manual(values = c('#4C92FE', '#00A99D', '#755BC6', '#9B7562')) +
+  theme_classic() +
+  theme(axis.text.x = element_text(angle = 90)) +
+  ggtitle("Overall Proportion in All Clusters")
+```
+
+# Differential Gene Expression Within Fibroblasts
+```{r}
+tic('ClusterMarker auto-export loop')#start timer
+path_out <- '~/Sean/DEG/Harmony/E90P3P106mo_PFDermMerged/'#path to export folder
+COI <- levels(PigMerged_derm@active.ident)#define the clusters you wish to know diff. gene expression of
+
+PigMerged_derm <- PrepSCTFindMarkers(PigMerged_derm)
+
+n_genes <- length(PigMerged_derm@assays[["SCT"]]@data@Dimnames[[1]])#get # of genes we will be testing
+n_loops <- 1
+while (n_loops < length(COI) + 1) {
+#Find positive markers (upregulated genes)
+cluster.markers.temp <- FindMarkers(PigMerged_derm, ident.1 = COI[n_loops], min.pct = 0.05, logfc.threshold = 0.0, assay = 'SCT', only.pos = TRUE)#iterate through the entire COI list
+#head(cluster.markers.temp, n = 30)
+cluster.markers.temp$Gene = rownames(cluster.markers.temp)#add a column for the gene name
+cluster.markers.temp$pct.2[cluster.markers.temp$pct.2 == 0] <- NA#corrects pct ratio error if pct.2=0
+cluster.markers.temp <- na.omit(cluster.markers.temp)#remove rows with NA
+cluster.markers.temp$Pct_Ratio = cluster.markers.temp$pct.1 / cluster.markers.temp$pct.2#compute ratio of how much the cluster of interest expresses compared to all other cells
+cluster.markers.temp <- cluster.markers.temp %>% dplyr::select('Gene', everything())#move gene column to the front of the dataframe
+cluster.markers.temp$'PctRatio_x_logfc' = cluster.markers.temp$Pct_Ratio * cluster.markers.temp$avg_log2FC
+cluster.markers.temp <- cluster.markers.temp[cluster.markers.temp$PctRatio_x_logfc > quantile(cluster.markers.temp$PctRatio_x_logfc, 0.95), ]#keep only the top 95% of upregulated genes in ident.1
+cluster.markers.temp <- cluster.markers.temp[order(cluster.markers.temp$PctRatio_x_logfc, decreasing = TRUE), ]#rank genes
+write.csv(cluster.markers.temp, file = paste(path_out, COI[n_loops], '_pos_markers.csv', sep = ''), row.names = FALSE)#save that cluster's markers
+
+n_loops <- n_loops + 1#track for when all clusters of one dataset have been run through
+}
+toc()#end timer
+```
+
+#Curated DotPlot
+ENSSSCG00000026302 is MKI67; includes core signaling ligands and DEGs from the merged dataset
+
+
+'EDAR', 'LEF1', 'SOX9', 'KRT15', 'KRT14', 'ITGB4', 'ITGA6', 'ENSSSCG00000026302', 'KRT10', 'KRT1', 'CNFN', 'VIM', 'COL1A1', 'COL3A1', 'PDGFRA', 'COL2A1', 'RGS5', 'ACTA2', 'PECAM1', 'CDH5', 'LYVE1', 'FLT4', 'SOX10', 'KRT20', 'ADIPOQ', 'MYOD1', 'PAX7', 'MYL1', 'PTPRC', 'CD68', 'ALAS2'
+```{r fig.height=7, fig.width=8}
+path_out <- '~/Sean/Heatmaps/Harmony/'
+GOI <- c('PDGFRA', 'COL3A1', 'COL1A1', 'APCDD1', 'TOP2A', 'ENSSSCG00000026302', 'ALX4', 'CTHRC1', 'PDGFRB', 'ACTA2', 'RGS5', 'IGFBP7', 'PECAM1', 'CDH5', 'LYVE1', 'FLT4', 'CCL21', 'VEGFA', 'VEGFC', 'VEGFD', 'PDGFA', 'PDGFB', 'PDGFC', 'ANGPTL1', 'ANGPTL2', 'ANGPTL4', 'ANGPT1', 'ANGPT2')
+
+sc_fig <- PigMerged_derm#store seurat object in temp object for cluster reordering
+DimPlot(sc_fig)
+
+#DotPlot
+sc_fig@active.ident <- factor(sc_fig@active.ident, levels = c('1. Fibro', '2. PECAM1 Fibro', '3. Div Fibro', '4. ALX4 Fibro', 
+                                                                              '5. CTHRC1 Fibro', '6. Peri', '7. IL6 Peri', '8. Peri2', 
+                                                                              '9. Div Peri', '10. BV', '11. Div BV', '12. LV'))
+
+p1 <- DotPlot(object = sc_fig, features = rev(GOI)) +
+        scale_colour_gradientn(colours = divergentcolors_RYB(50)) +
+        coord_flip() + theme_classic() + theme(axis.text.x = element_text(angle = 90))
+p1
+ggsave(plot = p1, filename = 'E90P3P106mo_PigMerged_PFDermis_CellTypes_DotPlot.png', path = path_out)
+
+
+remove(sc_fig)#save memory
+```
+
+## Recolor the UMAP clusters by cell lineage
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Sean/UMAP/'
+p1 <- DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.5,
+              cols = c('#006837', '#238b45', '#52ba55', '#00441b', 
+                       '#41ab5d', '#7fcdbb', '#4db89f', '#6bd9cd', 
+                       '#6fe5ca', '#8c6bb1', '#6f479c', '#88419d')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90_P3_P10_6mo Merged UMAP (PFDerm) v2.png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.3, group.by = 'orig.ident', 
+              cols = c('#9B7562', '#4C92FE', '#755BC6', '#00a99d')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90_P3_P10_6mo Merged UMAP (PFDerm, by orig.ident) v2.png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+p1 <- DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.3, group.by = 'orig.cluster') + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90_P3_P10_6mo Merged UMAP (PFDerm, by orig.cluster) v2.png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.3, group.by = 'orig.cluster')
+
+DimPlot(PigMerged_derm, label = FALSE, pt.size = 0.3, group.by = 'orig.ident',
+              cols = c('#9B7562', '#4C92FE', '#755BC6', '#00a99d'))
+
+```
+
+##Visualize Expression of 2 Genes in 1 FeaturePlot
+```{r fig.height=5, fig.width=15}
+GOI <- c('PDGFRA', 'PECAM1',  'RGS5', 'PDGFRB', 'CDH5', 'RGS5', 'COL1A1', 'ACTA2',
+         'VEGFD', 'VEGFA', 'VEGFC', 'ANGPTL4', 'ANGPTL2', 'ANGPTL1', 'ANGPTL2', 'ANGPTL4',
+         'ANGPT1', 'ANGPT2', 'TGFB1', 'TGFB2', 'SEMA3C', 'VEGFC', 'PDGFA', 'PDGFB',
+         'IL15', 'IL6', 'IL6', 'ANGPTL1', 'IL15', 'ANGPT2',
+         'CCL2', 'SEMA3C', 'TOP2A', 'PECAM1', 'ITGA6', 'ACTA2', 'IL16', 'GREM1', 'IL16', 'VEGFA', 'VEGFA', 'IL16'
+        )
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = PigMerged_derm,
+                    features = GOI[n_plot:(n_plot+1)],
+                    pt.size = 0.1,
+                    order = TRUE,
+                    blend = TRUE,
+                    max.cutoff = 'q90') + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 2
+}
+toc()
+```
+

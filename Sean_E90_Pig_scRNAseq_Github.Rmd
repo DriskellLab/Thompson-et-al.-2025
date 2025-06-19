@@ -1,0 +1,395 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#Load packages
+```{r}
+library(dplyr)
+library(Seurat)
+library(tictoc)
+library(reticulate)
+library(limma)#from Biocmanager
+library(viridisLite)
+library(RColorBrewer)
+library(ggplot2)
+library(patchwork)
+library(future)
+plan('multisession', workers = 5)#cores = 5
+options(future.globals.maxSize = 100000 * 1024^2)
+
+```
+
+#Load data
+```{r}
+# Load the e90 dataset
+e90.data <- Read10X_h5("/home/pheonix/Documents/h5files/e90pig.h5")
+
+# Initialize the Seurat object with the raw (non-normalized data).
+e90 <- CreateSeuratObject(counts = e90.data, project = "E90", min.cells = 3, min.features = 200)
+
+e90
+```
+
+#QC
+```{r}
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+e90[["percent.mt"]] <- PercentageFeatureSet(e90, pattern = "^MT")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(e90, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(e90, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(e90, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+```
+
+#QC filtering
+```{r}
+e90#before QC filter
+
+e90 <- subset(e90, subset = nCount_RNA > 1900 & nCount_RNA < 25000 & percent.mt < 5)
+
+e90
+```
+
+## SCTransform (Normalize, Scale Data)
+```{r, warning=FALSE, message=FALSE}
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+tic('Running SCTransform')
+e90 <- SCTransform(e90, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+e90 <- RunPCA(e90, verbose = FALSE)
+ElbowPlot(e90, ndims = 50)
+toc()
+```
+
+## UMAP (initial)
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+e90 <- RunUMAP(e90, dims = 1:40, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+e90 <- FindNeighbors(e90, dims = 1:40, verbose = FALSE)
+e90 <- FindClusters(e90, verbose = FALSE, algorithm = 3)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(e90, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(e90, label = FALSE, pt.size = 1.0) + NoLegend()
+#DimPlot(e90, label = FALSE)#no numbers on clusters, legend off to side
+
+toc()
+```
+
+## FeaturePlots: view single-cell gene expression across clusters
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+GOI <- c('nCount_RNA',
+         'PDGFRA', 'LRRC17', 'RUNX1T1', 'VIM', 'ACTA2', 'MYL1', 'MYL2', 
+         'LEF1', 'CRABP1', 'RGS5', 'PECAM1', 'CDH5', 'CDH11', 'LYVE1', 'FLT4', 'PTPRC', 'CD86', 'CDH1', 'KRT14', 'KRT5', 'KRT1', 'KRT10', 'KRT8', 'SOX6', 'SOX9',
+         'TOP2A', 'CEBPA', 'PPARG', 'FABP4', 'ADIPOQ', 'BMP7', 'VEGFA', 'SOX10', 'COL11A1')
+#path_out <- '.'
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = e90,
+                    features = GOI[n_plot],
+                    pt.size = 0.5,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+  }
+toc()
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+e90 <- FindClusters(e90, verbose = FALSE, algorithm = 3, resolution = 0.4)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(e90, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(e90, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+```
+
+## Differential Gene Expression
+```{r}
+tic('ClusterMarker auto-export loop')#start timer
+path_out <- '~/Desktop/Sean_CellChat/DEG/E90/'#path to export folder
+COI <- levels(e90)#define the clusters you wish to know diff. gene expression of
+
+n_genes <- length(e90@assays[["SCT"]]@data@Dimnames[[1]])#get # of genes we will be testing
+n_loops <- 1
+while (n_loops < length(COI) + 1) {
+#Find positive markers (upregulated genes)
+cluster.markers.temp <- FindMarkers(e90, ident.1 = COI[n_loops], min.pct = 0.05, logfc.threshold = 0.0, assay = 'SCT', only.pos = TRUE)#iterate through the entire COI list
+#head(cluster.markers.temp, n = 30)
+cluster.markers.temp$Gene = rownames(cluster.markers.temp)#add a column for the gene name
+cluster.markers.temp$pct.2[cluster.markers.temp$pct.2 == 0] <- NA#corrects pct ratio error if pct.2=0
+cluster.markers.temp <- na.omit(cluster.markers.temp)#remove rows with NA
+cluster.markers.temp$Pct_Ratio = cluster.markers.temp$pct.1 / cluster.markers.temp$pct.2#compute ratio of how much the cluster of interest expresses compared to all other cells
+cluster.markers.temp <- cluster.markers.temp %>% dplyr::select('Gene', everything())#move gene column to the front of the dataframe
+cluster.markers.temp$'PctRatio_x_logfc' = cluster.markers.temp$Pct_Ratio * cluster.markers.temp$avg_log2FC
+cluster.markers.temp <- cluster.markers.temp[cluster.markers.temp$PctRatio_x_logfc > quantile(cluster.markers.temp$PctRatio_x_logfc, 0.95), ]#keep only the top 95% of upregulated genes in ident.1
+cluster.markers.temp <- cluster.markers.temp[order(cluster.markers.temp$PctRatio_x_logfc, decreasing = TRUE), ]#rank genes
+write.csv(cluster.markers.temp, file = paste(path_out, (n_loops-1), '_pos_markers.csv', sep = ''), row.names = FALSE)#save that cluster's markers
+
+n_loops <- n_loops + 1#track for when all clusters of one dataset have been run through
+}
+toc()#end timer
+```
+
+## Label the Clusters by Cell Type
+```{r message=FALSE, warning=FALSE}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids <- c('0 Basal Krtno', '1 Diff Krtno', '2 RF', '3 Basal Krtno', '4 PF', 
+                     '5 SG', '6 DPP4 Fibro', '7 Div Krtno', '8 Pdgfra- Fibro', '9 BV', 
+                     '10 DP DS APM', '11 SG', '12 Pericyte', '13 Macrophage', '14 Diff Krtno', 
+                     '15 Muscle', '16 Basal Bud', '17 Adipocyte', '18 Basal Krtno', '19 Schwann Cell', 
+                     '20 Erythro', '21 Immune Cell', '22 Basal Krtno', '23 LV', '24 Merkel')
+names(new.cluster.ids) <- levels(e90)
+e90 <- RenameIdents(e90, new.cluster.ids)
+```
+
+Save the Seurat object
+```{r}
+save(e90, file = '/media/sean/T2TB/Object/e90_pig_allclusters_v3.RData')
+```
+
+## Recolor the UMAP clusters by cell lineage
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Sean/UMAP/'
+p1 <- DimPlot(e90, label = FALSE, pt.size = 1, 
+              cols = c('#002783', '#64a7e9', '#41ab5d', '#16539e', '#00441b', 
+                     '#0c6395', '#006837', '#2565b5', '#a1d99b', '#8c6bb1', 
+                     '#238b45', '#1179a3', '#7fcdbb', '#790001', '#96ccff', 
+                     '#f768a1', '#00206a', '#bdbdbd', '#ae017e', '#ffab4b', 
+                     '#cc0000', '#BB0000', '#164c9a', '#88419d', '#fc8d59')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Pig E90 UMAP (All Clusters) updated.png', path = path_out,
+         width = 7, height = 7, units = 'in')
+```
+
+# Subset the Keratinocytes
+```{r message=FALSE, warning=FALSE}
+E90_krtno <- subset(e90, idents = c('0 Basal Krtno', '1 Diff Krtno', '3 Basal Krtno', '5 SG', '7 Div Krtno', 
+                     '11 SG', '14 Diff Krtno', '16 Basal Bud', '18 Basal Krtno', '20 Erythro', '22 Basal Krtno'), invert = FALSE)#subset the keratinocyte supercluster
+E90_krtno#view the subset
+
+## We want to renormalize the data to bring out the heterogenetiy within the lineage
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+tic('Running SCTransform')
+E90_krtno <- SCTransform(E90_krtno, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+E90_krtno <- RunPCA(E90_krtno, verbose = FALSE)
+ElbowPlot(E90_krtno, ndims = 50)
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+E90_krtno <- RunUMAP(E90_krtno, dims = 1:30, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+E90_krtno <- FindNeighbors(E90_krtno, dims = 1:30, verbose = FALSE)
+E90_krtno <- FindClusters(E90_krtno, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(E90_krtno, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(E90_krtno, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+```
+
+### View Gene Expression of Keratinocyte Heterogeneity Markers
+```{r fig.height=5, fig.width=7}
+## FeaturePlots: view single-cell gene expression across clusters
+DimPlot(E90_krtno, label = TRUE, pt.size = 2, label.size = 6.0)
+
+GOI <- c('PDGFRA', 'APOE', 'KRT14', 'KRT5', 'KRT10', 'KRT18', 'KRT8', 'CALML5', 'CDSN', 'CNFN', 'CDH1',
+         'TOP2A', 'ASPM', 'ITGA6', 'ITGB1', 'SOX6', 'SOX9', 'COL17A1', 'DLL1', 'KRT15', 'VEGFA', 'KRT10', 'nFeature_SCT', 'TGFBI', 'DPP4', 'ACTA2', 'PPARG', 'LEF1', 'CTNNB1')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = E90_krtno,
+                    features = GOI[n_plot],
+                    pt.size = 1.0,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+E90_krtno <- FindClusters(E90_krtno, verbose = FALSE, algorithm = 3, resolution = 0.5)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(E90_krtno, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(E90_krtno, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+```
+
+# Differential Gene Expression Within Keratinocytes
+```{r}
+tic('ClusterMarker auto-export loop')#start timer
+path_out <- '~/Desktop/Sean_CellChat/DEG/Krtno/E90/'#path to export folder
+COI <- c('0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '10', '11', '12')#define the clusters you wish to know diff. gene expression of
+
+n_genes <- length(E90_krtno@assays[["SCT"]]@data@Dimnames[[1]])#get # of genes we will be testing
+n_loops <- 1
+while (n_loops < length(COI) + 1) {
+#Find positive markers (upregulated genes)
+cluster.markers.temp <- FindMarkers(E90_krtno, ident.1 = COI[n_loops], min.pct = 0.05, logfc.threshold = 0.0, assay = 'SCT', only.pos = TRUE)#iterate through the entire COI list
+#head(cluster.markers.temp, n = 30)
+cluster.markers.temp$Gene = rownames(cluster.markers.temp)#add a column for the gene name
+cluster.markers.temp$pct.2[cluster.markers.temp$pct.2 == 0] <- NA#corrects pct ratio error if pct.2=0
+cluster.markers.temp <- na.omit(cluster.markers.temp)#remove rows with NA
+cluster.markers.temp$Pct_Ratio = cluster.markers.temp$pct.1 / cluster.markers.temp$pct.2#compute ratio of how much the cluster of interest expresses compared to all other cells
+cluster.markers.temp <- cluster.markers.temp %>% dplyr::select('Gene', everything())#move gene column to the front of the dataframe
+cluster.markers.temp$'PctRatio_x_logfc' = cluster.markers.temp$Pct_Ratio * cluster.markers.temp$avg_log2FC
+cluster.markers.temp <- cluster.markers.temp[cluster.markers.temp$PctRatio_x_logfc > quantile(cluster.markers.temp$PctRatio_x_logfc, 0.95), ]#keep only the top 95% of upregulated genes in ident.1
+cluster.markers.temp <- cluster.markers.temp[order(cluster.markers.temp$PctRatio_x_logfc, decreasing = TRUE), ]#rank genes
+write.csv(cluster.markers.temp, file = paste(path_out, COI[n_loops], '_pos_markers.csv', sep = ''), row.names = FALSE)#save that cluster's markers
+
+n_loops <- n_loops + 1#track for when all clusters of one dataset have been run through
+}
+toc()#end timer
+```
+
+## Label the clusters
+```{r message=FALSE, warning=FALSE}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids.sub <- c('0 SOX6 Basal', '1 Diff Krtno', '2 Diff Krtno', '3 Div Krtno', '4 Sweat Gland', '5 Sweat Gland', '6 Corneocyte', '7 Sweat Gland', '8 Basal Bud', '9 Metab Krtno', '10 Muscle', '11 Erythrocyte', '12 PTHLH Sox9 Basal')
+names(new.cluster.ids.sub) <- levels(E90_krtno)
+E90_krtno <- RenameIdents(E90_krtno, new.cluster.ids.sub)
+```
+
+##Fig Quality DimPlot
+```{r fig.height=5, fig.width=7}
+DimPlot(E90_krtno, label = TRUE, pt.size = 1.0, label.size = 6,
+        cols = c('#0c3695', '#f0b627', '#107de9', '#225ea8', 
+                 '#00441b', '#1a9850', '#ff692b', '#66bd63', 
+                 '#00206a', '#6b92c3', '#f768a1', '#900101', 
+                 '#2c72c8'))#legend
+DimPlot(E90_krtno, label = FALSE, pt.size = 1.0,
+        cols = c('#0c3695', '#f0b627', '#107de9', '#225ea8', 
+                 '#00441b', '#1a9850', '#ff692b', '#66bd63', 
+                 '#00206a', '#6b92c3', '#f768a1', '#900101', 
+                 '#2c72c8')) + NoLegend()#blank
+
+```
+
+#Keratinocyte Subset (Keratinocytes only)
+Subset keratinocyte supercluster and subset out contaminating cells
+```{r}
+#plot <- DimPlot(E90_krtno)
+
+#selectedcells <- CellSelector(plot = plot)#grab the cells in the umap to keep
+#selectedcells
+# Automatically set the identity class of selected cells and return a new Seurat object
+#E90_krtno_sub <- CellSelector(plot = plot, object = E90_krtno, ident = 'E90SelectedCells')
+#DimPlot(E90_krtno_sub)
+
+cds_e90sub <- as.cell_data_set(E90_krtno, group.by = 'SCT_snn_res.0.5')#function from SeuratWrappers to convert to Monocle3 object, graph argument specifies the clustering to transfer (assay to use, and active resolution) to @clusters
+#cds_e90sub <- cluster_cells(cds_e90sub, reduction_method = "UMAP", group_cells_by = 'seurat_clusters')#
+
+#Add some info not carried over by SeuratWrappers
+cds_e90sub <- estimate_size_factors(cds_e90sub)#add size factor metadata to CDS object
+cds_e90sub@rowRanges@elementMetadata@listData[["gene_short_name"]] <- rownames(E90_krtno)#correct gene names in CDS object
+
+#Validate UMAP coordinate transfer from Seurat object -> CDS object
+temp1 <- E90_krtno@reductions$umap@cell.embeddings#large matrix with rows cell barcodes and 2 columns for the Seurat x/y UMAP coordinates
+temp2 <- cds_e90sub@int_colData@listData$reducedDims$UMAP#matrix with rows cell barcodes and 2 columns for x/y UMAP coordinates
+table(temp1 == temp2)#if all TRUE, seuratwrapper successfully transferred umap coordinates to CDS object via the graph argument
+#cds_e90sub@int_colData@listData$reducedDims$UMAP <- E90_krtno@reductions$umap@cell.embeddings#not needed due to graph argument when making CDS object
+
+#need to transfer Seurat PCA since this wasn't transferred by seurat wrapper
+reducedDim(cds_e90sub, type = "PCA") <- E90_krtno@reductions$pca@cell.embeddings#transfer the matrix results of Seurat PCA to CDS
+#cds_e90sub@preprocess_aux$prop_var_expl <- E90_krtno@reductions$pca@stdev#transfer numerical vector containing stdev values per PCA dimension
+
+#partitions and cleaner subset still need to be created for learn_graph()
+sub_cells <- choose_cells(cds_e90sub, return_list = TRUE)#get cell barcodes to make new seurat subset
+plot <- DimPlot(E90_krtno, cells = as.vector(sub_cells))
+plot
+E90_krtno_sub <- subset(E90_krtno, cells = sub_cells)#subset to the clean clusters
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+E90_krtno_sub <- RunUMAP(E90_krtno_sub, dims = 1:30, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+E90_krtno_sub <- FindNeighbors(E90_krtno_sub, dims = 1:30, verbose = FALSE)
+E90_krtno_sub <- FindClusters(E90_krtno_sub, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(E90_krtno_sub, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(E90_krtno_sub, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+```
+
+### View Gene Expression of Keratinocyte Heterogeneity Markers
+```{r fig.height=5, fig.width=5}
+## FeaturePlots: view single-cell gene expression across clusters
+DimPlot(E90_krtno_sub, label = TRUE, pt.size = 2, label.size = 6.0)
+
+GOI <- c('KRT14', 'KRT5', 'KRT10', 'KRT18', 'KRT8', 'CALML5', 'CDSN', 'CNFN', 'CDH1',
+         'TOP2A', 'ITGA6', 'ITGB1', 'SOX6', 'SOX9', 'COL17A1', 'DLL1', 'KRT15', 'VEGFA', 'KRT10', 'nFeature_SCT', 'LEF1', 'EDAR')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = E90_krtno_sub,
+                    features = GOI[n_plot],
+                    pt.size = 1.0,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+E90_krtno_sub <- FindClusters(E90_krtno_sub, verbose = FALSE, algorithm = 3, resolution = 0.4)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(E90_krtno_sub, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(E90_krtno_sub, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+```
+
+Save Seurat object
+```{r}
+save(E90_krtno_sub, file = '/t2tb/Object/E90_pig_krtno_sub.RData')
+```
+
+##Fig Quality DimPlot
+```{r fig.height=5, fig.width=7}
+path_out <- '~/Sean/UMAP/'
+p1<- DimPlot(E90_krtno_sub, label = FALSE, pt.size = 1.0,
+        cols = c('#0c3695', '#f0b627', '#107de9', '#225ea8', '#ff692b', '#00206a', '#6b92c3')) + NoLegend()#blank
+p1
+
+#ggsave(plot = p1, filename = 'Pig E90 UMAP (Krtno Sub).png', path = path_out,
+#         width = 7, height = 7, units = 'in')
+```

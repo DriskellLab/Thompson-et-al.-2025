@@ -1,0 +1,325 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+#0. Load packages & data
+Requires installation of R.utils package
+```{r}
+library(dplyr)
+library(ggplot2)
+library(Seurat)
+library(tictoc)
+library(reticulate)
+library(limma)#from Biocmanager
+library(viridisLite)
+library(patchwork)
+library(data.table)
+library(monocle3)#installed via devtools::install_github('cole-trapnell-lab/monocle3')
+library(SeuratWrappers)#installed via remotes::install_github('satijalab/seurat-wrappers')
+library(stringr)
+library(stringi)
+library(future)
+library(tictoc)#useful to time long steps
+plan('multisession', workers = 12)#cores = 12
+options(future.globals.maxSize = 64000 * 1024^2)
+```
+
+#Citation for Cheng et al. 2018 scRNA-seq datasets
+Cheng et al. 2018. Transcriptional Programming of Normal and Inflamed Human Epidermis at Single-Cell Resolution. Cell Reports, Volume 25, Issue 4, 871 - 883. DOI: 10.1016/j.celrep.2018.09.006
+
+#load Cheng et al. 2018 foreskin scRNA data
+```{r}
+tic("Initializing and Merging Cheng et al. 2018 Foreskin scRNA")
+
+#Load the Cheng et al. foreskin datasets
+mat <- fread("~/Documents/Cheng2018/exprMatrix.tsv.gz")
+meta <- read.table("~/Documents/Cheng2018/meta.tsv", header=T, sep="\t", as.is=T, row.names=1)
+genes = mat[,1][[1]]
+genes = gsub(".+[|]", "", genes)
+mat = data.frame(mat[,-1], row.names=genes)
+
+#convert tissue and sample metadata columns to factors
+head(meta, n=10)#sample & tissue metadata columns are both chr vectors
+meta$sample <- as.factor(meta$sample)
+head(meta, n=10)#now sample is factor and tissue is chr vector
+meta$tissue <- as.factor(meta$tissue)
+
+#filter metadata by sample
+sample_ids <- levels(meta$sample)#get vector of sample ids
+meta_sample <- meta$sample#extract all ordered
+
+#sample 4 (fore12)
+meta_1 <- meta[meta$sample == sample_ids[4], ]#filter the metadata (barcode rows) by sample
+mat_1 <- t(mat)#transpose the gene x cell matrix so it is easy to filter the barcodes based on the filtered metadata rownames
+mat_1 <- as.data.frame(mat_1)#convert large matrix to dataframe
+mat_1name <- rownames(mat_1)#vector of barcodes from raw cell x gene matrix
+mat_1name <- gsub(pattern = ".", replacement = "-", x = mat_1name, fixed = TRUE)#find and replace all . in barcode id with - to be consistent with metadata
+rownames(mat_1) <- mat_1name#replace . in barcode for cell x matrix with - to have same barcode syntax as meta
+mat_1name <- rownames(mat_1)#vector of barcodes from raw cell x gene matrix
+meta_1name <- rownames(meta_1)#vector of barcodes from filtered metadata
+match_i <- pmatch(x = meta_1name, table = mat_1name)#find index position of individual match of matrix barcode from metadata barcodes
+mat_1 <- mat_1[match_i, ]#filter the gene matrix
+mat_1 <- as.data.frame(t(mat_1))#transpose back to the gene x cell matrix, then convert to dataframe again
+Cheng_4 <- CreateSeuratObject(counts = mat_1, project = 'Cheng_fore12', meta.data=meta_1)#create Seurat object for the isolated sample
+
+#sample 5 (fore8)
+meta_1 <- meta[meta$sample == sample_ids[5], ]#filter the metadata (barcode rows) by sample
+mat_1 <- t(mat)#transpose the gene x cell matrix so it is easy to filter the barcodes based on the filtered metadata rownames
+mat_1 <- as.data.frame(mat_1)#convert large matrix to dataframe
+mat_1name <- rownames(mat_1)#vector of barcodes from raw cell x gene matrix
+mat_1name <- gsub(pattern = ".", replacement = "-", x = mat_1name, fixed = TRUE)#find and replace all . in barcode id with - to be consistent with metadata
+rownames(mat_1) <- mat_1name#replace . in barcode for cell x matrix with - to have same barcode syntax as meta
+mat_1name <- rownames(mat_1)#vector of barcodes from raw cell x gene matrix
+meta_1name <- rownames(meta_1)#vector of barcodes from filtered metadata
+match_i <- pmatch(x = meta_1name, table = mat_1name)#find index position of individual match of matrix barcode from metadata barcodes
+mat_1 <- mat_1[match_i, ]#filter the gene matrix
+mat_1 <- as.data.frame(t(mat_1))#transpose back to the gene x cell matrix, then convert to dataframe again
+Cheng_5 <- CreateSeuratObject(counts = mat_1, project = 'Cheng_fore8', meta.data=meta_1)#create Seurat object for the isolated sample
+
+#sample 6 (fore9)
+meta_1 <- meta[meta$sample == sample_ids[6], ]#filter the metadata (barcode rows) by sample
+mat_1 <- t(mat)#transpose the gene x cell matrix so it is easy to filter the barcodes based on the filtered metadata rownames
+mat_1 <- as.data.frame(mat_1)#convert large matrix to dataframe
+mat_1name <- rownames(mat_1)#vector of barcodes from raw cell x gene matrix
+mat_1name <- gsub(pattern = ".", replacement = "-", x = mat_1name, fixed = TRUE)#find and replace all . in barcode id with - to be consistent with metadata
+rownames(mat_1) <- mat_1name#replace . in barcode for cell x matrix with - to have same barcode syntax as meta
+mat_1name <- rownames(mat_1)#vector of barcodes from raw cell x gene matrix
+meta_1name <- rownames(meta_1)#vector of barcodes from filtered metadata
+match_i <- pmatch(x = meta_1name, table = mat_1name)#find index position of individual match of matrix barcode from metadata barcodes
+mat_1 <- mat_1[match_i, ]#filter the gene matrix
+mat_1 <- as.data.frame(t(mat_1))#transpose back to the gene x cell matrix, then convert to dataframe again
+Cheng_6 <- CreateSeuratObject(counts = mat_1, project = 'Cheng_fore9', meta.data=meta_1)#create Seurat object for the isolated sample
+
+
+Cheng_4
+Cheng_5
+Cheng_6
+
+#now create the merged foreskin Seurat object
+Cheng_Human <- merge(x = Cheng_4, y = c(Cheng_5, Cheng_6), add.cell.ids = c('C_4', 'C_5', 'C_6'), project = 'Cheng_Human_Merged')
+
+toc()
+```
+
+#QC
+```{r}
+Cheng_Human#view merged seurat object
+table(Cheng_Human$orig.ident)#view cell count breakdown between samples within the merged dataset
+
+# The [[ operator can add columns to object metadata. This is a great place to stash QC stats
+Cheng_Human[["percent.mt"]] <- PercentageFeatureSet(Cheng_Human, pattern = "^MT")
+
+# Visualize QC metrics as a violin plot
+VlnPlot(Cheng_Human, features = c("nFeature_RNA", "nCount_RNA"), ncol = 2)
+VlnPlot(Cheng_Human, features = c("percent.mt"), ncol = 1)
+
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(Cheng_Human, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(Cheng_Human, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+
+```
+
+#QC Filter
+```{r}
+Cheng_Human <- subset(x = Cheng_Human, 
+                          subset = percent.mt < 5 &
+                        percent.mt > 1)
+Cheng_Human
+```
+
+## SCTransform (Normalize, Scale Data)
+```{r, warning=FALSE, message=FALSE}
+#Run sctransform (replaces NormalizeData, ScaleData, and FindVariableFeatures + RegressOut argument of ScaleData)
+tic('Running SCTransform')
+Cheng_Human <- SCTransform(Cheng_Human, vars.to.regress = "percent.mt", verbose = FALSE)
+toc()
+#Dimensional Reduction and Elbow Plot
+Cheng_Human <- RunPCA(Cheng_Human, verbose = FALSE)
+ElbowPlot(Cheng_Human, ndims = 50)
+```
+
+## UMAP (initial)
+Pick dimensions to use based on ElbowPlot above
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+tic('Running UMAP & Making DimPlots')
+#run the UMAP function using dimensions informed by elbow plot
+Cheng_Human <- RunUMAP(Cheng_Human, dims = 1:30, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+Cheng_Human <- FindNeighbors(Cheng_Human, dims = 1:30, verbose = FALSE)
+Cheng_Human <- FindClusters(Cheng_Human, verbose = FALSE, algorithm = 3)#default is algorithm = 1/2 (Louvain), 3 = SLM (scATAC), 4 = Leiden (doesn't work on server with large datasets)
+DimPlot(Cheng_Human, label = TRUE, pt.size = 0.5, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Cheng_Human, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(Cheng_Human, group.by = 'orig.ident', pt.size = 0.5)
+#DimPlot(Cheng_Human, label = FALSE)#no numbers on clusters, legend off to side
+toc()
+
+#Check QC Metrics on Clustering
+FeaturePlot(Cheng_Human, features = c('nFeature_RNA', 'nCount_RNA'))
+FeaturePlot(Cheng_Human, features = c('percent.mt'))
+```
+
+## FeaturePlots: view single-cell gene expression across clusters
+```{r fig.height=5, fig.width=7, message=FALSE, warning=FALSE}
+GOI <- c('VIM', 'PECAM1', 'VEGFA', 'SOX9', 'KRT15', "COL7A1",
+         'PTPRC', 'CD86', 'CDH1', 'ITGA6', 'KRT14', 'KRT5', 'KRT1', 'KRT10', 'KRT8', 'KRT18',
+         'CDSN', 'TOP2A', 'SOX10', 'DCT', 'TYRP1', 'DLL1', 'DLK2', 'LEF1', 'EDAR')
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = Cheng_Human,
+                    features = GOI[n_plot],
+                    pt.size = 0.1,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+  }
+toc()
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+Cheng_Human <- FindClusters(Cheng_Human, verbose = FALSE, algorithm = 3, resolution = 0.5)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(Cheng_Human, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Cheng_Human, label = FALSE, pt.size = 1.0) + NoLegend()#no labels (to label in photoshop)
+DimPlot(Cheng_Human, group.by = 'orig.ident', pt.size = 0.5)
+```
+
+## Label the Clusters by Cell Type
+```{r message=FALSE, warning=FALSE}
+#updated renaming convention in Seurat 3.0.0+ and Signac 1.0.0+
+new.cluster.ids.all <- c('0 Diff Krtno', '1 Diff Krtno', '2 Basal Krtno', '3 Basal Krtno', '4 Basal Krtno',
+                     '5 Melanocyte', '6 Melanocyte', '7 Div Krtno Cells', '8 Sox9 Krtno', '9 Immune Cell', '10 Immune Cell')
+names(new.cluster.ids.all) <- levels(Cheng_Human)
+Cheng_Human <- RenameIdents(Cheng_Human, new.cluster.ids.all)
+```
+
+Save the R object
+```{r}
+save(Cheng_Human, file = '~/Desktop/Sean_CellChat/Object/Cheng2018_Fore_AllClusters.RData')#final object w/ labels
+```
+
+## Recolor the UMAP clusters by cell lineage
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Desktop/Sean_CellChat/UMAP/'
+p1 <- DimPlot(Cheng_Human, label = FALSE, pt.size = 0.5, 
+              cols = c('#7ac9f8', '#64a7e9', '#002783', '#2565b5', '#16539e',
+                     '#fc8d59', '#f16913', '#4d8ad5', '#00206a', '#790001', '#cc0000')) + NoLegend()#manual colors w/o legend
+p1
+ggsave(plot = p1, filename = 'Cheng2018 Human NeoFore UMAP (All Clusters).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+```
+
+## Figure FeaturePlots: view single-cell gene expression across clusters
+```{r fig.height=7, fig.width=7, message=FALSE, warning=FALSE}
+GOI <- c('ANGPTL4')
+path_out <- '~/Desktop/Sean_CellChat/UMAP/FigFeaturePlots/Hs_Cheng/'
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = Cheng_Human,
+                    features = GOI[n_plot],
+                    pt.size = 0.1,
+                    order = TRUE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  ggsave(plot = p1, filename = paste(GOI[n_plot], 'Cheng Human FeaturePlot.png', sep = ' '), path = path_out,
+         width = 5, height = 5, units = 'in')
+  n_plot <- n_plot + 1
+  }
+toc()
+```
+
+#2. Subset keratinocytes only
+Select keratinocyte supercluster
+```{r}
+Cheng_krtno <- subset(Cheng_Human, idents = c('0 Diff Krtno', '1 Diff Krtno', '2 Basal Krtno', '3 Basal Krtno', '4 Basal Krtno',
+                     '7 Div Krtno Cells'), invert = FALSE)#subset the keratinocyte clusters
+Cheng_krtno#view the subset
+```
+
+Based on ElbowPlot, pick major PCs for next steps
+```{r message=FALSE, warning=FALSE}
+tic('Running UMAPs')
+#run the UMAP function using dimensions informed by elbow plot
+Cheng_krtno <- RunUMAP(Cheng_krtno, dims = 1:20, verbose = FALSE, umap.method = "umap-learn", metric = "correlation")#default is dims = 1:30
+#Higher PCs (dims=1:30) can represent subtle but relevant sources of heterogeneity
+Cheng_krtno <- FindNeighbors(Cheng_krtno, dims = 1:20, verbose = FALSE)
+Cheng_krtno <- FindClusters(Cheng_krtno, verbose = FALSE, algorithm = 3, resolution = 0.6)#default is algorithm = 1 (Louvain), 3 = SLM
+toc()
+DimPlot(Cheng_krtno, label = TRUE, pt.size = 1.0, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Cheng_krtno, label = FALSE, pt.size = 1.0) + NoLegend()#no labels
+DimPlot(Cheng_krtno, label = FALSE, pt.size = 1.0, group.by = 'orig.ident')#colored by sample
+```
+
+#FeaturePlot
+```{r fig.height=5, fig.width=5, message=FALSE, warning=FALSE}
+## FeaturePlots: view single-cell gene expression across clusters
+GOI <- c("KRT14", "KRT10", "CNFN", "KRT15", "ITGA6", "ITGB1", 
+         "LEF1", "EDAR", "SOX6", "SOX9", "COL17A1", "VEGFA", "TOP2A", "PDGFC", "EDA", "AREG", "EREG", "KRT8", "KRT18", "KRT19", "BMP7", "SOCS3", "NRG1",
+         "ANGPTL4", "RARG", "FABP5")
+
+## View Gene Expression ##
+tic('FeaturePlot auto-export')
+#Export loop for FeaturePlot() for each Gene in GOI list
+n_plot <- 1
+while (n_plot < length(GOI) + 1) {
+  p1 <- FeaturePlot(object = Cheng_krtno,
+                    features = GOI[n_plot],
+                    pt.size = 0.01,
+                    order = FALSE) + 
+    scale_colour_gradientn(colours = magma(50))#iterate through the genes of interest vector inputting their coordinates
+  
+  print(p1)#spare the markdown file saving tons of plots
+  
+  #save the FeaturePlots automatically
+  #ggsave(plot = p1, filename = paste(GOI[n_plot], 'FeaturePlot.png', sep = ' '), path = path_out,
+  #       width = 6, height = 4, units = 'in')
+  n_plot <- n_plot + 1
+}
+toc()
+```
+
+### Change Resolution
+```{r message=FALSE, warning=FALSE}
+Cheng_krtno <- FindClusters(Cheng_krtno, verbose = FALSE, algorithm = 3, resolution = 0.05)#default is algorithm = 1 (Louvain), 3 = SLM
+DimPlot(Cheng_krtno, label = TRUE, pt.size = 0.5, label.size = 6) + NoLegend()#numbers on clusters
+DimPlot(Cheng_krtno, label = FALSE, pt.size = 0.5) + NoLegend()#no labels (to label in photoshop)
+DimPlot(Cheng_krtno, label = FALSE, pt.size = 0.5, group.by = 'orig.ident')#no labels (to label in photoshop)
+```
+
+##Figure quality UMAP
+```{r fig.height=7, fig.width=7}
+path_out <- '~/Desktop/Sean_CellChat/UMAP/'
+DimPlot(Cheng_krtno, label = TRUE, pt.size = 1, label.size = 6,
+        cols = c('#0c3695', '#f0b627', '#225ea8'))#legend
+p1 <- DimPlot(Cheng_krtno, label = FALSE, pt.size = 1,
+        cols = c('#0c3695', '#f0b627', '#225ea8')) + NoLegend()#blank
+p1
+
+ggsave(plot = p1, filename = 'Cheng2018 Human UMAP (Keratinocytes).png', path = path_out,
+         width = 7, height = 7, units = 'in')
+
+```
+
+Save the R object
+```{r}
+save(Cheng_krtno, file = '/t2tb/Object/Cheng2018_Krtno.RData')
+```
+
